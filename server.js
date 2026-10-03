@@ -2,6 +2,8 @@ const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 const cors = require('cors');
+const cryptoVault = require('./cryptoVault');
+const offlineStore = require('./offlineStore');
 
 const app = express();
 app.use(cors());
@@ -23,7 +25,6 @@ function normalizePhone(phone) {
 
 // Memory stores
 const activeClients = new Map(); // mobile -> { ws, nickname, lastSeen }
-const offlineQueue = new Map();  // recipientMobile -> [ messages ]
 const registeredUsers = new Map(); // mobile -> { mobile, nickname, registeredAt }
 
 // REST Endpoints
@@ -31,6 +32,7 @@ app.get('/', (req, res) => {
   const host = req.headers.host || 'localhost:8080';
   const protocol = req.headers['x-forwarded-proto'] === 'https' ? 'wss' : 'ws';
   const wsUrl = `${protocol}://${host}`;
+  const vaultStats = offlineStore.getStats();
 
   res.send(`<!DOCTYPE html>
 <html lang="en">
@@ -41,13 +43,15 @@ app.get('/', (req, res) => {
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
     body { background-color: #0f111a; color: #f3f4f6; display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 20px; }
-    .container { background: #1a1c29; border: 1px solid #282c3f; border-radius: 16px; padding: 32px; max-width: 520px; width: 100%; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+    .container { background: #1a1c29; border: 1px solid #282c3f; border-radius: 16px; padding: 32px; max-width: 540px; width: 100%; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
     .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
     .title { font-size: 20px; font-weight: 700; color: #fff; }
     .status-badge { background: rgba(16, 185, 129, 0.15); border: 1px solid #10b981; color: #10b981; padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; }
     .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #10b981; animation: pulse 2s infinite; }
     @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; } }
-    .desc { color: #9ca3af; font-size: 14px; line-height: 1.5; margin-bottom: 24px; }
+    .desc { color: #9ca3af; font-size: 14px; line-height: 1.5; margin-bottom: 20px; }
+    .security-banner { background: rgba(99, 102, 241, 0.12); border: 1px solid rgba(99, 102, 241, 0.35); border-radius: 10px; padding: 12px 16px; margin-bottom: 20px; font-size: 13px; color: #c7d2fe; display: flex; justify-content: space-between; align-items: center; }
+    .sec-tag { background: #4f46e5; color: #fff; padding: 2px 8px; border-radius: 6px; font-size: 11px; font-weight: 700; }
     .section-title { font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; color: #6366f1; font-weight: 700; margin-bottom: 8px; }
     .url-box { background: #12131e; border: 1px solid #2d314d; border-radius: 10px; padding: 14px; display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; word-break: break-all; }
     .url-text { font-family: monospace; font-size: 14px; color: #818cf8; font-weight: 600; }
@@ -65,8 +69,13 @@ app.get('/', (req, res) => {
       <div class="title">🔒 Stealth Chat Server</div>
       <div class="status-badge"><span class="status-dot"></span> Live & Ready</div>
     </div>
-    <p class="desc">Real-time WebSocket and end-to-end encrypted relay backend is active and ready for incoming Android connections.</p>
+    <p class="desc">Real-time WebSocket backend with persistent offline message holding and server-side AES-256-GCM encryption at rest.</p>
     
+    <div class="security-banner">
+      <span>🛡️ Server Encryption: <strong>AES-256-GCM</strong> (Key ID: ${cryptoVault.getKeyFingerprint()})</span>
+      <span class="sec-tag">ACTIVE</span>
+    </div>
+
     <div class="section-title">App WebSocket Connection URL</div>
     <div class="url-box">
       <span class="url-text">${wsUrl}</span>
@@ -81,6 +90,14 @@ app.get('/', (req, res) => {
         <div class="stat-val">${registeredUsers.size}</div>
         <div class="stat-lbl">Registered Devices</div>
       </div>
+      <div class="stat-card">
+        <div class="stat-val">${vaultStats.pendingMessagesCount}</div>
+        <div class="stat-lbl">Offline Messages in Vault</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-val">${vaultStats.pendingStatusesCount}</div>
+        <div class="stat-lbl">Queued Delivery Receipts</div>
+      </div>
     </div>
 
     <div class="footer">
@@ -92,11 +109,19 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
+  const stats = offlineStore.getStats();
   res.json({
     status: 'ok',
     service: 'stealth-chat-backend',
+    encryption: {
+      type: 'AES-256-GCM',
+      keyFingerprint: cryptoVault.getKeyFingerprint(),
+      atRest: true
+    },
     activeConnections: activeClients.size,
     registeredUsersCount: registeredUsers.size,
+    offlineMessagesCount: stats.pendingMessagesCount,
+    offlineStatusesCount: stats.pendingStatusesCount,
     timestamp: new Date().toISOString()
   });
 });
@@ -177,15 +202,22 @@ wss.on('connection', (ws, req) => {
             mobile: cleanMobile
           }));
 
-          // Flush offline queued messages
-          if (offlineQueue.has(cleanMobile)) {
-            const queue = offlineQueue.get(cleanMobile);
-            console.log(`[WS] Delivering ${queue.length} queued offline messages to ${cleanMobile}`);
-            while (queue.length > 0) {
-              const queuedMsg = queue.shift();
+          // Flush offline queued messages held in encrypted vault
+          const queuedMessages = offlineStore.dequeueMessages(cleanMobile);
+          if (queuedMessages.length > 0) {
+            console.log(`[WS] Delivering ${queuedMessages.length} queued offline messages from encrypted vault to ${cleanMobile}`);
+            for (const queuedMsg of queuedMessages) {
               ws.send(JSON.stringify(queuedMsg));
             }
-            offlineQueue.delete(cleanMobile);
+          }
+
+          // Flush any pending status updates (e.g. DELIVERED / READ receipts that occurred while this client was offline)
+          const queuedStatuses = offlineStore.dequeueStatuses(cleanMobile);
+          if (queuedStatuses.length > 0) {
+            console.log(`[WS] Delivering ${queuedStatuses.length} queued status updates to ${cleanMobile}`);
+            for (const statusMsg of queuedStatuses) {
+              ws.send(JSON.stringify(statusMsg));
+            }
           }
           break;
         }
@@ -217,7 +249,7 @@ wss.on('connection', (ws, req) => {
             id: messageId,
             sender,
             recipient,
-            text: msg.text, // Encrypted payload
+            text: msg.text,
             timestamp
           };
 
@@ -235,12 +267,9 @@ wss.on('connection', (ws, req) => {
               recipient
             }));
           } else {
-            // Queue for offline delivery
-            console.log(`[WS] Recipient ${recipient} is offline. Message queued.`);
-            if (!offlineQueue.has(recipient)) {
-              offlineQueue.set(recipient, []);
-            }
-            offlineQueue.get(recipient).push(relayPayload);
+            // Queue in persistent, server-side encrypted vault
+            console.log(`[WS] Recipient ${recipient} is offline. Encrypting with AES-256-GCM and storing in offline vault.`);
+            offlineStore.enqueueMessage(recipient, relayPayload);
           }
           break;
         }
@@ -248,13 +277,19 @@ wss.on('connection', (ws, req) => {
         case 'STATUS_UPDATE': {
           const target = normalizePhone(msg.to);
           const targetSession = activeClients.get(target);
+          const statusPayload = {
+            type: 'STATUS_UPDATE',
+            id: msg.id,
+            status: msg.status, // "DELIVERED" or "READ"
+            from: authenticatedMobile
+          };
+
           if (targetSession && targetSession.ws.readyState === WebSocket.OPEN) {
-            targetSession.ws.send(JSON.stringify({
-              type: 'STATUS_UPDATE',
-              id: msg.id,
-              status: msg.status, // "DELIVERED" or "READ"
-              from: authenticatedMobile
-            }));
+            targetSession.ws.send(JSON.stringify(statusPayload));
+          } else {
+            // Target is currently offline, store encrypted status update in offline vault
+            console.log(`[WS] Target ${target} for status update is offline. Encrypting & storing status receipt.`);
+            offlineStore.enqueueStatus(target, statusPayload);
           }
           break;
         }
@@ -300,6 +335,8 @@ wss.on('connection', (ws, req) => {
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`\n======================================================`);
   console.log(` Stealth Chat WebSocket Server running on port ${PORT}`);
+  console.log(` Server-Side Encryption: AES-256-GCM [Key ID: ${cryptoVault.getKeyFingerprint()}]`);
+  console.log(` Offline Encrypted Vault: Active (data/offline_vault.json)`);
   console.log(` Health check: http://localhost:${PORT}/health`);
   console.log(` WebSocket URL: ws://localhost:${PORT}`);
   console.log(`======================================================\n`);
