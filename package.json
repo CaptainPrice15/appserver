@@ -1,0 +1,18 @@
+{
+  "name": "stealth-chat-server",
+  "version": "1.0.0",
+  "description": "Real-time WebSocket and Express backend for Stealth Minigame Chat",
+  "main": "server.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test_client.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "ws": "^8.18.0"
+  }
+}
