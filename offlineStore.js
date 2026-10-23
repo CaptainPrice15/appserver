@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const cryptoVault = require('./cryptoVault');
+const { normalizePhone, phonesMatch } = require('./phoneUtils');
 
 const DATA_DIR = path.join(__dirname, 'data');
 const STORE_FILE = path.join(DATA_DIR, 'offline_vault.json');
@@ -64,10 +65,12 @@ class OfflineStore {
    */
   enqueueMessage(recipientMobile, relayPayload) {
     try {
+      const cleanMobile = normalizePhone(recipientMobile);
       const envelope = cryptoVault.encryptEnvelope(relayPayload);
       const record = {
         id: relayPayload.id || `msg_${Date.now()}`,
-        recipient: recipientMobile,
+        recipient: cleanMobile,
+        rawRecipient: recipientMobile,
         sender: relayPayload.sender || '',
         timestamp: relayPayload.timestamp || Date.now(),
         envelope
@@ -75,7 +78,7 @@ class OfflineStore {
 
       this.messages.push(record);
       this.save();
-      console.log(`[OfflineStore] Encrypted & queued offline message ${record.id} for ${recipientMobile}`);
+      console.log(`[OfflineStore] Encrypted & queued offline message ${record.id} for ${cleanMobile} (input: ${recipientMobile})`);
       return true;
     } catch (err) {
       console.error('[OfflineStore] Failed to enqueue message:', err.message);
@@ -84,14 +87,18 @@ class OfflineStore {
   }
 
   /**
-   * Retrieves, decrypts, and removes all pending messages for a recipient
+   * Retrieves, decrypts, and removes all pending messages for a recipient.
+   * Matches both normalized and raw recipient phone number variations.
    */
   dequeueMessages(recipientMobile) {
     const toDeliver = [];
     const remaining = [];
 
     for (const record of this.messages) {
-      if (record.recipient === recipientMobile) {
+      const isMatch = phonesMatch(record.recipient, recipientMobile) ||
+                      (record.rawRecipient && phonesMatch(record.rawRecipient, recipientMobile));
+
+      if (isMatch) {
         try {
           const decryptedPayload = cryptoVault.decryptEnvelope(record.envelope);
           toDeliver.push(decryptedPayload);
@@ -117,9 +124,11 @@ class OfflineStore {
    */
   enqueueStatus(targetMobile, statusPayload) {
     try {
+      const cleanMobile = normalizePhone(targetMobile);
       const envelope = cryptoVault.encryptEnvelope(statusPayload);
       const record = {
-        target: targetMobile,
+        target: cleanMobile,
+        rawTarget: targetMobile,
         timestamp: Date.now(),
         envelope
       };
@@ -141,7 +150,10 @@ class OfflineStore {
     const remaining = [];
 
     for (const record of this.statuses) {
-      if (record.target === targetMobile) {
+      const isMatch = phonesMatch(record.target, targetMobile) ||
+                      (record.rawTarget && phonesMatch(record.rawTarget, targetMobile));
+
+      if (isMatch) {
         try {
           const decryptedPayload = cryptoVault.decryptEnvelope(record.envelope);
           toDeliver.push(decryptedPayload);
@@ -167,6 +179,23 @@ class OfflineStore {
       pendingMessagesCount: this.messages.length,
       pendingStatusesCount: this.statuses.length,
       pendingRecipientsCount: uniqueRecipients.size
+    };
+  }
+
+  getPendingOverview() {
+    return {
+      messages: this.messages.map(m => ({
+        id: m.id,
+        recipient: m.recipient,
+        rawRecipient: m.rawRecipient,
+        sender: m.sender,
+        timestamp: m.timestamp
+      })),
+      statuses: this.statuses.map(s => ({
+        target: s.target,
+        rawTarget: s.rawTarget,
+        timestamp: s.timestamp
+      }))
     };
   }
 

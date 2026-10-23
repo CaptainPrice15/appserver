@@ -4,6 +4,7 @@ const WebSocket = require('ws');
 const cors = require('cors');
 const cryptoVault = require('./cryptoVault');
 const offlineStore = require('./offlineStore');
+const { normalizePhone, phonesMatch } = require('./phoneUtils');
 
 const app = express();
 app.use(cors());
@@ -14,18 +15,73 @@ const PORT = process.env.PORT || 8080;
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// Normalizes phone numbers to standard format (digits and optional leading +)
-function normalizePhone(phone) {
-  if (!phone) return '';
-  const trimmed = phone.trim();
-  const hasPlus = trimmed.startsWith('+');
-  const digits = trimmed.replace(/\D/g, '');
-  return hasPlus ? `+${digits}` : digits;
-}
-
 // Memory stores
 const activeClients = new Map(); // mobile -> { ws, nickname, lastSeen }
 const registeredUsers = new Map(); // mobile -> { mobile, nickname, registeredAt }
+
+// Helper to find client session by exact or flexible phone match
+function findActiveClient(phone) {
+  if (!phone) return null;
+  const norm = normalizePhone(phone);
+  if (activeClients.has(norm)) {
+    return { mobile: norm, session: activeClients.get(norm) };
+  }
+  for (const [clientMobile, session] of activeClients.entries()) {
+    if (phonesMatch(clientMobile, phone)) {
+      return { mobile: clientMobile, session };
+    }
+  }
+  return null;
+}
+
+// Helper to find registered user by exact or flexible phone match
+function findRegisteredUser(phone) {
+  if (!phone) return null;
+  const norm = normalizePhone(phone);
+  if (registeredUsers.has(norm)) {
+    return registeredUsers.get(norm);
+  }
+  for (const [userMobile, user] of registeredUsers.entries()) {
+    if (phonesMatch(userMobile, phone)) {
+      return user;
+    }
+  }
+  return null;
+}
+
+// Helper to flush all pending vault messages and delivery receipts for a mobile
+function flushVaultForMobile(mobile, targetWs = null) {
+  let ws = targetWs;
+  if (!ws) {
+    const client = findActiveClient(mobile);
+    if (client && client.session.ws.readyState === WebSocket.OPEN) {
+      ws = client.session.ws;
+    }
+  }
+
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    return { deliveredMessages: 0, deliveredStatuses: 0 };
+  }
+
+  const cleanMobile = normalizePhone(mobile);
+  const queuedMessages = offlineStore.dequeueMessages(cleanMobile);
+  if (queuedMessages.length > 0) {
+    console.log(`[WS] Delivering ${queuedMessages.length} queued offline messages from encrypted vault to ${cleanMobile}`);
+    for (const queuedMsg of queuedMessages) {
+      ws.send(JSON.stringify(queuedMsg));
+    }
+  }
+
+  const queuedStatuses = offlineStore.dequeueStatuses(cleanMobile);
+  if (queuedStatuses.length > 0) {
+    console.log(`[WS] Delivering ${queuedStatuses.length} queued status updates to ${cleanMobile}`);
+    for (const statusMsg of queuedStatuses) {
+      ws.send(JSON.stringify(statusMsg));
+    }
+  }
+
+  return { deliveredMessages: queuedMessages.length, deliveredStatuses: queuedStatuses.length };
+}
 
 // REST Endpoints
 app.get('/', (req, res) => {
@@ -144,13 +200,14 @@ app.post('/api/users/register', (req, res) => {
 });
 
 app.get('/api/users/check', (req, res) => {
-  const cleanMobile = normalizePhone(req.query.mobile);
-  const user = registeredUsers.get(cleanMobile);
-  const isOnline = activeClients.has(cleanMobile);
+  const phone = req.query.mobile;
+  const cleanMobile = normalizePhone(phone);
+  const user = findRegisteredUser(phone);
+  const clientInfo = findActiveClient(phone);
 
   res.json({
     exists: !!user,
-    isOnline,
+    isOnline: !!clientInfo,
     user: user || null
   });
 });
@@ -158,9 +215,30 @@ app.get('/api/users/check', (req, res) => {
 app.get('/api/users', (req, res) => {
   const users = Array.from(registeredUsers.values()).map(u => ({
     ...u,
-    isOnline: activeClients.has(u.mobile)
+    isOnline: !!findActiveClient(u.mobile)
   }));
   res.json(users);
+});
+
+// Vault diagnostic and manual flush endpoints
+app.get('/api/vault/pending', (req, res) => {
+  res.json(offlineStore.getPendingOverview());
+});
+
+app.get('/api/vault/flush', (req, res) => {
+  let totalMessages = 0;
+  let totalStatuses = 0;
+  for (const [clientMobile, session] of activeClients.entries()) {
+    const result = flushVaultForMobile(clientMobile, session.ws);
+    totalMessages += result.deliveredMessages;
+    totalStatuses += result.deliveredStatuses;
+  }
+  res.json({
+    success: true,
+    flushedMessages: totalMessages,
+    flushedStatuses: totalStatuses,
+    remainingVaultStats: offlineStore.getStats()
+  });
 });
 
 // WebSocket Real-time Messaging
@@ -203,22 +281,7 @@ wss.on('connection', (ws, req) => {
           }));
 
           // Flush offline queued messages held in encrypted vault
-          const queuedMessages = offlineStore.dequeueMessages(cleanMobile);
-          if (queuedMessages.length > 0) {
-            console.log(`[WS] Delivering ${queuedMessages.length} queued offline messages from encrypted vault to ${cleanMobile}`);
-            for (const queuedMsg of queuedMessages) {
-              ws.send(JSON.stringify(queuedMsg));
-            }
-          }
-
-          // Flush any pending status updates (e.g. DELIVERED / READ receipts that occurred while this client was offline)
-          const queuedStatuses = offlineStore.dequeueStatuses(cleanMobile);
-          if (queuedStatuses.length > 0) {
-            console.log(`[WS] Delivering ${queuedStatuses.length} queued status updates to ${cleanMobile}`);
-            for (const statusMsg of queuedStatuses) {
-              ws.send(JSON.stringify(statusMsg));
-            }
-          }
+          flushVaultForMobile(cleanMobile, ws);
           break;
         }
 
@@ -253,11 +316,15 @@ wss.on('connection', (ws, req) => {
             timestamp
           };
 
-          // Check if recipient is online
-          const recipientSession = activeClients.get(recipient);
-          if (recipientSession && recipientSession.ws.readyState === WebSocket.OPEN) {
-            recipientSession.ws.send(JSON.stringify(relayPayload));
-            console.log(`[WS] Delivered in real-time to ${recipient}`);
+          // Check if recipient is online (exact or resilient match)
+          const clientInfo = findActiveClient(recipient);
+          if (clientInfo && clientInfo.session.ws.readyState === WebSocket.OPEN) {
+            // First flush any previously queued vault messages for this recipient
+            flushVaultForMobile(clientInfo.mobile, clientInfo.session.ws);
+
+            // Deliver message in real-time
+            clientInfo.session.ws.send(JSON.stringify(relayPayload));
+            console.log(`[WS] Delivered in real-time to ${recipient} (mapped to: ${clientInfo.mobile})`);
 
             // Notify sender of delivery
             ws.send(JSON.stringify({
@@ -276,7 +343,7 @@ wss.on('connection', (ws, req) => {
 
         case 'STATUS_UPDATE': {
           const target = normalizePhone(msg.to);
-          const targetSession = activeClients.get(target);
+          const clientInfo = findActiveClient(target);
           const statusPayload = {
             type: 'STATUS_UPDATE',
             id: msg.id,
@@ -284,8 +351,8 @@ wss.on('connection', (ws, req) => {
             from: authenticatedMobile
           };
 
-          if (targetSession && targetSession.ws.readyState === WebSocket.OPEN) {
-            targetSession.ws.send(JSON.stringify(statusPayload));
+          if (clientInfo && clientInfo.session.ws.readyState === WebSocket.OPEN) {
+            clientInfo.session.ws.send(JSON.stringify(statusPayload));
           } else {
             // Target is currently offline, store encrypted status update in offline vault
             console.log(`[WS] Target ${target} for status update is offline. Encrypting & storing status receipt.`);
@@ -296,9 +363,9 @@ wss.on('connection', (ws, req) => {
 
         case 'TYPING': {
           const target = normalizePhone(msg.to);
-          const targetSession = activeClients.get(target);
-          if (targetSession && targetSession.ws.readyState === WebSocket.OPEN) {
-            targetSession.ws.send(JSON.stringify({
+          const clientInfo = findActiveClient(target);
+          if (clientInfo && clientInfo.session.ws.readyState === WebSocket.OPEN) {
+            clientInfo.session.ws.send(JSON.stringify({
               type: 'TYPING',
               from: authenticatedMobile,
               isTyping: !!msg.isTyping
@@ -323,7 +390,10 @@ wss.on('connection', (ws, req) => {
   ws.on('close', () => {
     if (authenticatedMobile) {
       console.log(`[WS] Client disconnected: ${authenticatedMobile}`);
-      activeClients.delete(authenticatedMobile);
+      const current = activeClients.get(authenticatedMobile);
+      if (current && current.ws === ws) {
+        activeClients.delete(authenticatedMobile);
+      }
     }
   });
 
