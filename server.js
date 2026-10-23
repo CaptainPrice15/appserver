@@ -374,6 +374,33 @@ wss.on('connection', (ws, req) => {
           break;
         }
 
+        case 'PANIC_ALERT': {
+          const target = normalizePhone(msg.to);
+          const sender = normalizePhone(msg.sender || msg.from || authenticatedMobile);
+
+          if (!target) break;
+
+          console.log(`[WS] Panic alert received: ${sender} -> ${target}`);
+          const clientInfo = findActiveClient(target);
+          const panicPayload = {
+            type: 'PANIC_ALERT',
+            from: sender,
+            timestamp: msg.timestamp || Date.now()
+          };
+
+          if (clientInfo && clientInfo.session.ws.readyState === WebSocket.OPEN) {
+            clientInfo.session.ws.send(JSON.stringify(panicPayload));
+            console.log(`[WS] Panic alert routed in real-time to ${target} (${clientInfo.mobile})`);
+          } else {
+            console.log(`[WS] Target ${target} for panic alert is offline. Storing in offline vault.`);
+            offlineStore.enqueueMessage(target, {
+              ...panicPayload,
+              id: `panic_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`
+            });
+          }
+          break;
+        }
+
         case 'PING': {
           ws.send(JSON.stringify({ type: 'PONG' }));
           break;
