@@ -187,12 +187,167 @@ async function runTestSuite() {
   assert.strictEqual(remainingStats.pendingMessagesCount, 0, 'Vault must safely purge delivered messages');
   console.log(' -> PASSED: Delivered messages safely purged from the server vault.');
 
-  // Clean up
+  // Clean up Test 1-4 sockets
   phoneA.close();
   phoneB.close();
+  await sleep(300);
+
+  // -------------------------------------------------------------
+  // Test 5: Multi-Device Concurrent Sessions, Fan-out & MSG_SYNC
+  // -------------------------------------------------------------
+  console.log('\n[Test 5] Testing Multi-Device Concurrent Sessions, Fan-out & MSG_SYNC...');
+  let carolDev1 = await connectSocket(SERVER_URL);
+  let carolDev2 = await connectSocket(SERVER_URL);
+  let daveDev1 = await connectSocket(SERVER_URL);
+
+  let c1LinkedDevices = null;
+  let c2LinkedDevices = null;
+  let c2ReceivedSyncMsg = null;
+  let d1ReceivedMsg = null;
+  let c1ReceivedReadStatus = false;
+  let c2ReceivedReadStatus = false;
+
+  carolDev1.on('message', (raw) => {
+    const msg = JSON.parse(raw.toString());
+    if (msg.type === 'REGISTER_ACK' || msg.type === 'DEVICE_LIST_UPDATE') {
+      c1LinkedDevices = msg.linkedDevices;
+    }
+    if (msg.type === 'STATUS_UPDATE' && msg.status === 'READ') {
+      c1ReceivedReadStatus = true;
+    }
+  });
+
+  carolDev2.on('message', (raw) => {
+    const msg = JSON.parse(raw.toString());
+    if (msg.type === 'REGISTER_ACK' || msg.type === 'DEVICE_LIST_UPDATE') {
+      c2LinkedDevices = msg.linkedDevices;
+    }
+    if (msg.type === 'MSG_SYNC') {
+      c2ReceivedSyncMsg = msg;
+    }
+    if (msg.type === 'STATUS_UPDATE' && msg.status === 'READ') {
+      c2ReceivedReadStatus = true;
+    }
+  });
+
+  daveDev1.on('message', (raw) => {
+    const msg = JSON.parse(raw.toString());
+    if (msg.type === 'MSG_RELAY') {
+      d1ReceivedMsg = msg;
+    }
+  });
+
+  // Register Carol on 2 devices with the same mobile number
+  carolDev1.send(JSON.stringify({
+    type: 'REGISTER',
+    mobile: '+15550003',
+    nickname: 'Carol',
+    deviceId: 'carol_phone',
+    deviceName: 'Carol Galaxy S24'
+  }));
+
+  carolDev2.send(JSON.stringify({
+    type: 'REGISTER',
+    mobile: '+15550003',
+    nickname: 'Carol',
+    deviceId: 'carol_tablet',
+    deviceName: 'Carol Galaxy Tab'
+  }));
+
+  daveDev1.send(JSON.stringify({
+    type: 'REGISTER',
+    mobile: '+15550004',
+    nickname: 'Dave',
+    deviceId: 'dave_phone',
+    deviceName: 'Dave Pixel 8'
+  }));
+
+  await sleep(600);
+
+  assert(c1LinkedDevices && c1LinkedDevices.length === 2, `Carol Dev 1 must see 2 linked devices, got: ${JSON.stringify(c1LinkedDevices)}`);
+  assert(c2LinkedDevices && c2LinkedDevices.length === 2, `Carol Dev 2 must see 2 linked devices, got: ${JSON.stringify(c2LinkedDevices)}`);
+  console.log(' -> PASSED: Carol registered 2 devices concurrently under one mobile number!');
+
+  // Carol sends a message from Phone (dev 1) to Dave
+  const multiMsgText = 'Multi-device greeting from Carol Phone';
+  carolDev1.send(JSON.stringify({
+    type: 'SEND_MSG',
+    id: 'msg_multi_1',
+    sender: '+15550003',
+    recipient: '+15550004',
+    text: multiMsgText,
+    senderDeviceId: 'carol_phone'
+  }));
+
+  await sleep(500);
+
+  // Dave receives it
+  assert(d1ReceivedMsg !== null, 'Dave must receive the relayed message');
+  assert.strictEqual(d1ReceivedMsg.text, multiMsgText);
+
+  // Carol Tablet (dev 2) receives MSG_SYNC
+  assert(c2ReceivedSyncMsg !== null, 'Carol Tablet (dev 2) must receive MSG_SYNC');
+  assert.strictEqual(c2ReceivedSyncMsg.text, multiMsgText);
+  assert.strictEqual(c2ReceivedSyncMsg.recipient, '+15550004');
+  console.log(' -> PASSED: Dave received relayed message AND Carol Tablet received MSG_SYNC self-sync!');
+
+  // Dave marks as READ
+  daveDev1.send(JSON.stringify({
+    type: 'STATUS_UPDATE',
+    id: 'msg_multi_1',
+    status: 'READ',
+    to: '+15550003'
+  }));
+
+  await sleep(400);
+
+  assert(c1ReceivedReadStatus, 'Carol Phone must receive READ status update');
+  assert(c2ReceivedReadStatus, 'Carol Tablet must also receive READ status update (fan-out)');
+  console.log(' -> PASSED: Read status update fanned out to both of Carol\'s devices!');
+
+  // Disconnect Carol Tablet and test offline hold specifically for dev 2
+  carolDev2.close();
+  await sleep(300);
+
+  daveDev1.send(JSON.stringify({
+    type: 'SEND_MSG',
+    id: 'msg_multi_offline_tablet',
+    sender: '+15550004',
+    recipient: '+15550003',
+    text: 'Hey Carol Tablet check this out'
+  }));
+
+  await sleep(400);
+
+  // Reconnect Carol Tablet
+  let tabletQueuedReceived = false;
+  carolDev2 = await connectSocket(SERVER_URL);
+  carolDev2.on('message', (raw) => {
+    const msg = JSON.parse(raw.toString());
+    if (msg.type === 'MSG_RELAY' && msg.id === 'msg_multi_offline_tablet') {
+      tabletQueuedReceived = true;
+    }
+  });
+
+  carolDev2.send(JSON.stringify({
+    type: 'REGISTER',
+    mobile: '+15550003',
+    nickname: 'Carol',
+    deviceId: 'carol_tablet',
+    deviceName: 'Carol Galaxy Tab'
+  }));
+
+  await sleep(500);
+  assert(tabletQueuedReceived, 'Reconnected Carol Tablet must receive offline queued message');
+  console.log(' -> PASSED: Offline queue delivered message to tablet upon reconnecting!');
+
+  // Clean up
+  carolDev1.close();
+  carolDev2.close();
+  daveDev1.close();
 
   console.log('\n================================================================');
-  console.log(' ALL TESTS PASSED: Offline Message Holding & Server Encryption verified!');
+  console.log(' ALL TESTS PASSED: Offline Message Holding & Multi-Device verified!');
   console.log('================================================================\n');
   process.exit(0);
 }

@@ -61,9 +61,9 @@ class OfflineStore {
   }
 
   /**
-   * Encrypts and holds a relay message for an offline recipient
+   * Encrypts and holds a relay message for an offline recipient (optionally targeted to specific device IDs)
    */
-  enqueueMessage(recipientMobile, relayPayload) {
+  enqueueMessage(recipientMobile, relayPayload, targetDeviceIds = null) {
     try {
       const cleanMobile = normalizePhone(recipientMobile);
       const envelope = cryptoVault.encryptEnvelope(relayPayload);
@@ -73,12 +73,13 @@ class OfflineStore {
         rawRecipient: recipientMobile,
         sender: relayPayload.sender || '',
         timestamp: relayPayload.timestamp || Date.now(),
+        pendingDeviceIds: Array.isArray(targetDeviceIds) && targetDeviceIds.length > 0 ? [...targetDeviceIds] : null,
         envelope
       };
 
       this.messages.push(record);
       this.save();
-      console.log(`[OfflineStore] Encrypted & queued offline message ${record.id} for ${cleanMobile} (input: ${recipientMobile})`);
+      console.log(`[OfflineStore] Encrypted & queued offline message ${record.id} for ${cleanMobile} (devices: ${record.pendingDeviceIds ? record.pendingDeviceIds.join(',') : 'all'})`);
       return true;
     } catch (err) {
       console.error('[OfflineStore] Failed to enqueue message:', err.message);
@@ -87,10 +88,10 @@ class OfflineStore {
   }
 
   /**
-   * Retrieves, decrypts, and removes all pending messages for a recipient.
+   * Retrieves, decrypts, and removes pending messages for a recipient device.
    * Matches both normalized and raw recipient phone number variations.
    */
-  dequeueMessages(recipientMobile) {
+  dequeueMessages(recipientMobile, deviceId = null) {
     const toDeliver = [];
     const remaining = [];
 
@@ -99,21 +100,39 @@ class OfflineStore {
                       (record.rawRecipient && phonesMatch(record.rawRecipient, recipientMobile));
 
       if (isMatch) {
-        try {
-          const decryptedPayload = cryptoVault.decryptEnvelope(record.envelope);
-          toDeliver.push(decryptedPayload);
-        } catch (err) {
-          console.error(`[OfflineStore] Decryption failed for message ${record.id}:`, err.message);
+        let shouldDeliver = false;
+        if (!deviceId || deviceId === 'default' || !record.pendingDeviceIds) {
+          // Legacy, default device, or broadcast to any connecting device
+          shouldDeliver = true;
+          record.pendingDeviceIds = null;
+        } else if (record.pendingDeviceIds.includes(deviceId)) {
+          shouldDeliver = true;
+          // Remove this deviceId from pending list
+          record.pendingDeviceIds = record.pendingDeviceIds.filter(id => id !== deviceId);
+        }
+
+        if (shouldDeliver) {
+          try {
+            const decryptedPayload = cryptoVault.decryptEnvelope(record.envelope);
+            toDeliver.push(decryptedPayload);
+          } catch (err) {
+            console.error(`[OfflineStore] Decryption failed for message ${record.id}:`, err.message);
+          }
+        }
+
+        // Keep record if there are still other devices waiting for it
+        if (record.pendingDeviceIds && record.pendingDeviceIds.length > 0) {
+          remaining.push(record);
         }
       } else {
         remaining.push(record);
       }
     }
 
-    if (toDeliver.length > 0) {
+    if (toDeliver.length > 0 || remaining.length !== this.messages.length) {
       this.messages = remaining;
       this.save();
-      console.log(`[OfflineStore] Dequeued & decrypted ${toDeliver.length} offline messages for ${recipientMobile}`);
+      console.log(`[OfflineStore] Dequeued & decrypted ${toDeliver.length} offline messages for ${recipientMobile} (device: ${deviceId || 'any'})`);
     }
 
     return toDeliver;
@@ -122,7 +141,7 @@ class OfflineStore {
   /**
    * Encrypts and holds a status update (delivery/read receipt) for an offline target
    */
-  enqueueStatus(targetMobile, statusPayload) {
+  enqueueStatus(targetMobile, statusPayload, targetDeviceIds = null) {
     try {
       const cleanMobile = normalizePhone(targetMobile);
       const envelope = cryptoVault.encryptEnvelope(statusPayload);
@@ -130,6 +149,7 @@ class OfflineStore {
         target: cleanMobile,
         rawTarget: targetMobile,
         timestamp: Date.now(),
+        pendingDeviceIds: Array.isArray(targetDeviceIds) && targetDeviceIds.length > 0 ? [...targetDeviceIds] : null,
         envelope
       };
 
@@ -143,9 +163,9 @@ class OfflineStore {
   }
 
   /**
-   * Retrieves, decrypts, and removes all pending status updates for a target
+   * Retrieves, decrypts, and removes pending status updates for a target device
    */
-  dequeueStatuses(targetMobile) {
+  dequeueStatuses(targetMobile, deviceId = null) {
     const toDeliver = [];
     const remaining = [];
 
@@ -154,18 +174,33 @@ class OfflineStore {
                       (record.rawTarget && phonesMatch(record.rawTarget, targetMobile));
 
       if (isMatch) {
-        try {
-          const decryptedPayload = cryptoVault.decryptEnvelope(record.envelope);
-          toDeliver.push(decryptedPayload);
-        } catch (err) {
-          console.error(`[OfflineStore] Decryption failed for status record:`, err.message);
+        let shouldDeliver = false;
+        if (!deviceId || deviceId === 'default' || !record.pendingDeviceIds) {
+          shouldDeliver = true;
+          record.pendingDeviceIds = null;
+        } else if (record.pendingDeviceIds.includes(deviceId)) {
+          shouldDeliver = true;
+          record.pendingDeviceIds = record.pendingDeviceIds.filter(id => id !== deviceId);
+        }
+
+        if (shouldDeliver) {
+          try {
+            const decryptedPayload = cryptoVault.decryptEnvelope(record.envelope);
+            toDeliver.push(decryptedPayload);
+          } catch (err) {
+            console.error(`[OfflineStore] Decryption failed for status record:`, err.message);
+          }
+        }
+
+        if (record.pendingDeviceIds && record.pendingDeviceIds.length > 0) {
+          remaining.push(record);
         }
       } else {
         remaining.push(record);
       }
     }
 
-    if (toDeliver.length > 0) {
+    if (toDeliver.length > 0 || remaining.length !== this.statuses.length) {
       this.statuses = remaining;
       this.save();
     }
