@@ -2,6 +2,8 @@ const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
 const cryptoVault = require('./cryptoVault');
 const offlineStore = require('./offlineStore');
 const { normalizePhone, phonesMatch } = require('./phoneUtils');
@@ -9,6 +11,12 @@ const { normalizePhone, phonesMatch } = require('./phoneUtils');
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// Media Storage Directory for End-to-End Encrypted Blobs
+const MEDIA_DIR = path.join(__dirname, 'data', 'media');
+if (!fs.existsSync(MEDIA_DIR)) {
+  fs.mkdirSync(MEDIA_DIR, { recursive: true });
+}
 
 // Render sets PORT automatically (e.g., 10000); default to 8080 locally
 const PORT = process.env.PORT || 8080;
@@ -109,7 +117,7 @@ function findRegisteredUser(phone) {
 // Helper to flush all pending vault messages and delivery receipts for a device
 function flushVaultForDevice(mobile, deviceId, ws) {
   if (!ws || ws.readyState !== WebSocket.OPEN) {
-    return { deliveredMessages: 0, deliveredStatuses: 0 };
+    return { deliveredMessages: 0, deliveredStatuses: 0, deliveredReactions: 0 };
   }
 
   const cleanMobile = normalizePhone(mobile);
@@ -129,7 +137,15 @@ function flushVaultForDevice(mobile, deviceId, ws) {
     }
   }
 
-  return { deliveredMessages: queuedMessages.length, deliveredStatuses: queuedStatuses.length };
+  const queuedReactions = offlineStore.dequeueReactions(cleanMobile, deviceId);
+  if (queuedReactions.length > 0) {
+    console.log(`[WS] Delivering ${queuedReactions.length} queued reaction updates to ${cleanMobile} (device: ${deviceId || 'any'})`);
+    for (const reactionMsg of queuedReactions) {
+      ws.send(JSON.stringify(reactionMsg));
+    }
+  }
+
+  return { deliveredMessages: queuedMessages.length, deliveredStatuses: queuedStatuses.length, deliveredReactions: queuedReactions.length };
 }
 
 function flushVaultForMobile(mobile, targetWs = null) {
@@ -331,6 +347,58 @@ app.delete('/api/devices/:deviceId', (req, res) => {
   res.json({ success: true, remaining: getRegisteredDevicesList(norm) });
 });
 
+// Encrypted Media Upload & Streaming REST Endpoints
+app.post('/api/media/upload', express.raw({ type: '*/*', limit: '50mb' }), (req, res) => {
+  if (!req.body || req.body.length === 0) {
+    return res.status(400).json({ error: 'No media payload provided' });
+  }
+
+  const mediaId = `med_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+  const filePath = path.join(MEDIA_DIR, `${mediaId}.enc`);
+
+  fs.writeFile(filePath, req.body, (err) => {
+    if (err) {
+      console.error('[Media] Failed to write encrypted media file:', err.message);
+      return res.status(500).json({ error: 'Failed to write media to storage' });
+    }
+    console.log(`[Media] Uploaded encrypted blob ${mediaId} (${req.body.length} bytes)`);
+    res.json({
+      success: true,
+      mediaId,
+      size: req.body.length
+    });
+  });
+});
+
+app.get('/api/media/:mediaId', (req, res) => {
+  const rawId = req.params.mediaId || '';
+  const sanitizedId = rawId.replace(/[^a-zA-Z0-9_-]/g, '');
+  if (!sanitizedId) {
+    return res.status(400).json({ error: 'Invalid media ID' });
+  }
+
+  const filePath = path.join(MEDIA_DIR, `${sanitizedId}.enc`);
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ error: 'Media not found' });
+  }
+
+  res.setHeader('Content-Type', 'application/octet-stream');
+  res.setHeader('Cache-Control', 'public, max-age=86400');
+  const stream = fs.createReadStream(filePath);
+  stream.pipe(res);
+});
+
+app.delete('/api/media/:mediaId', (req, res) => {
+  const rawId = req.params.mediaId || '';
+  const sanitizedId = rawId.replace(/[^a-zA-Z0-9_-]/g, '');
+  const filePath = path.join(MEDIA_DIR, `${sanitizedId}.enc`);
+  if (fs.existsSync(filePath)) {
+    fs.unlinkSync(filePath);
+    return res.json({ success: true, mediaId: sanitizedId });
+  }
+  res.status(404).json({ error: 'Media not found' });
+});
+
 // Vault diagnostic and manual flush endpoints
 app.get('/api/vault/pending', (req, res) => {
   res.json(offlineStore.getPendingOverview());
@@ -339,17 +407,20 @@ app.get('/api/vault/pending', (req, res) => {
 app.get('/api/vault/flush', (req, res) => {
   let totalMessages = 0;
   let totalStatuses = 0;
+  let totalReactions = 0;
   for (const [clientMobile, deviceMap] of activeClients.entries()) {
     for (const [devId, session] of deviceMap.entries()) {
       const result = flushVaultForDevice(clientMobile, devId, session.ws);
       totalMessages += result.deliveredMessages;
       totalStatuses += result.deliveredStatuses;
+      totalReactions += (result.deliveredReactions || 0);
     }
   }
   res.json({
     success: true,
     flushedMessages: totalMessages,
     flushedStatuses: totalStatuses,
+    flushedReactions: totalReactions,
     remainingVaultStats: offlineStore.getStats()
   });
 });
@@ -449,15 +520,23 @@ wss.on('connection', (ws, req) => {
           const messageId = msg.id || `msg_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
           const timestamp = msg.timestamp || Date.now();
           const senderDeviceId = msg.senderDeviceId || authenticatedDeviceId || 'dev_sender';
+          const messageType = msg.messageType || 'TEXT';
+          const mediaId = msg.mediaId || null;
+          const isHd = !!msg.isHd;
+          const mediaSize = msg.mediaSize || 0;
 
-          console.log(`[WS] Message ${messageId}: ${sender} (${senderDeviceId}) -> ${recipient}`);
+          console.log(`[WS] Message ${messageId} (${messageType}${isHd ? ' [HD]' : ''}): ${sender} (${senderDeviceId}) -> ${recipient}`);
 
           // 1. Immediately acknowledge receipt to sender device (SENT status)
           ws.send(JSON.stringify({
             type: 'MSG_ACK',
             id: messageId,
             status: 'SENT',
-            timestamp
+            timestamp,
+            messageType,
+            mediaId,
+            isHd,
+            mediaSize
           }));
 
           // 2. Self-Sync: Deliver MSG_SYNC to all OTHER active devices owned by the sender
@@ -472,7 +551,11 @@ wss.on('connection', (ws, req) => {
                 text: msg.text,
                 timestamp,
                 status: 'SENT',
-                isOutgoing: true
+                isOutgoing: true,
+                messageType,
+                mediaId,
+                isHd,
+                mediaSize
               }));
               console.log(`[WS] Self-synced outgoing message ${messageId} to sender's other device: ${sSession.deviceId}`);
             }
@@ -489,7 +572,11 @@ wss.on('connection', (ws, req) => {
               text: msg.text,
               timestamp,
               status: 'SENT',
-              isOutgoing: true
+              isOutgoing: true,
+              messageType,
+              mediaId,
+              isHd,
+              mediaSize
             }, offlineSenderDevices);
           }
 
@@ -499,7 +586,11 @@ wss.on('connection', (ws, req) => {
             sender,
             recipient,
             text: msg.text,
-            timestamp
+            timestamp,
+            messageType,
+            mediaId,
+            isHd,
+            mediaSize
           };
 
           // 3. Multi-Device Fan-Out to Recipient
@@ -575,18 +666,29 @@ wss.on('connection', (ws, req) => {
 
         case 'MSG_REACTION': {
           const target = normalizePhone(msg.to);
+          const reactionVal = msg.reaction !== undefined ? msg.reaction : msg.emoji;
           const reactionPayload = {
             type: 'MSG_REACTION',
             id: msg.id,
-            reaction: msg.reaction,
+            reaction: reactionVal,
             from: authenticatedMobile
           };
 
           const targetSessions = getActiveDeviceSessions(target);
-          for (const tSession of targetSessions) {
-            if (tSession.ws.readyState === WebSocket.OPEN) {
-              tSession.ws.send(JSON.stringify(reactionPayload));
+          const targetOfflineDevices = getOfflineDeviceIds(target);
+
+          if (targetSessions.length > 0) {
+            for (const tSession of targetSessions) {
+              if (tSession.ws.readyState === WebSocket.OPEN) {
+                tSession.ws.send(JSON.stringify(reactionPayload));
+              }
             }
+          }
+
+          // If target is completely offline or has offline linked devices, enqueue in vault
+          if (targetOfflineDevices.length > 0 || targetSessions.length === 0) {
+            const targets = targetOfflineDevices.length > 0 ? targetOfflineDevices : null;
+            offlineStore.enqueueReaction(target, reactionPayload, targets);
           }
 
           // Self-sync reaction to reader's other devices
@@ -597,10 +699,21 @@ wss.on('connection', (ws, req) => {
                 mSession.ws.send(JSON.stringify({
                   type: 'REACTION_SYNC',
                   id: msg.id,
-                  reaction: msg.reaction,
+                  reaction: reactionVal,
                   peerMobile: target
                 }));
               }
+            }
+
+            // Also queue REACTION_SYNC for any offline devices of the reactor
+            const myOfflineDevices = getOfflineDeviceIds(authenticatedMobile).filter(id => id !== authenticatedDeviceId);
+            if (myOfflineDevices.length > 0) {
+              offlineStore.enqueueReaction(authenticatedMobile, {
+                type: 'REACTION_SYNC',
+                id: msg.id,
+                reaction: reactionVal,
+                peerMobile: target
+              }, myOfflineDevices);
             }
           }
           break;

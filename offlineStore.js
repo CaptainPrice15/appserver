@@ -11,6 +11,7 @@ class OfflineStore {
   constructor() {
     this.messages = [];
     this.statuses = [];
+    this.reactions = [];
     this.initialized = false;
     this.init();
   }
@@ -26,7 +27,8 @@ class OfflineStore {
         const data = JSON.parse(raw);
         this.messages = Array.isArray(data.messages) ? data.messages : [];
         this.statuses = Array.isArray(data.statuses) ? data.statuses : [];
-        console.log(`[OfflineStore] Loaded encrypted store: ${this.messages.length} messages, ${this.statuses.length} status receipts pending`);
+        this.reactions = Array.isArray(data.reactions) ? data.reactions : [];
+        console.log(`[OfflineStore] Loaded encrypted store: ${this.messages.length} messages, ${this.statuses.length} status receipts, ${this.reactions.length} reactions pending`);
       } else {
         this.save();
       }
@@ -35,6 +37,7 @@ class OfflineStore {
       console.error('[OfflineStore] Failed to initialize store, starting with empty state:', err.message);
       this.messages = [];
       this.statuses = [];
+      this.reactions = [];
       this.initialized = true;
     }
   }
@@ -49,7 +52,8 @@ class OfflineStore {
         version: 1,
         lastUpdated: Date.now(),
         messages: this.messages,
-        statuses: this.statuses
+        statuses: this.statuses,
+        reactions: this.reactions
       };
 
       const jsonStr = JSON.stringify(payload, null, 2);
@@ -208,11 +212,83 @@ class OfflineStore {
     return toDeliver;
   }
 
+  /**
+   * Encrypts and holds a reaction update for an offline target
+   */
+  enqueueReaction(targetMobile, reactionPayload, targetDeviceIds = null) {
+    try {
+      const cleanMobile = normalizePhone(targetMobile);
+      const envelope = cryptoVault.encryptEnvelope(reactionPayload);
+      const record = {
+        target: cleanMobile,
+        rawTarget: targetMobile,
+        timestamp: Date.now(),
+        pendingDeviceIds: Array.isArray(targetDeviceIds) && targetDeviceIds.length > 0 ? [...targetDeviceIds] : null,
+        envelope
+      };
+
+      this.reactions.push(record);
+      this.save();
+      console.log(`[OfflineStore] Encrypted & queued offline reaction for ${cleanMobile} (msg ${reactionPayload.id}: ${reactionPayload.reaction})`);
+      return true;
+    } catch (err) {
+      console.error('[OfflineStore] Failed to enqueue reaction:', err.message);
+      return false;
+    }
+  }
+
+  /**
+   * Retrieves, decrypts, and removes pending reactions for a target device
+   */
+  dequeueReactions(targetMobile, deviceId = null) {
+    const toDeliver = [];
+    const remaining = [];
+
+    for (const record of this.reactions) {
+      const isMatch = phonesMatch(record.target, targetMobile) ||
+                      (record.rawTarget && phonesMatch(record.rawTarget, targetMobile));
+
+      if (isMatch) {
+        let shouldDeliver = false;
+        if (!deviceId || deviceId === 'default' || !record.pendingDeviceIds) {
+          shouldDeliver = true;
+          record.pendingDeviceIds = null;
+        } else if (record.pendingDeviceIds.includes(deviceId)) {
+          shouldDeliver = true;
+          record.pendingDeviceIds = record.pendingDeviceIds.filter(id => id !== deviceId);
+        }
+
+        if (shouldDeliver) {
+          try {
+            const decryptedPayload = cryptoVault.decryptEnvelope(record.envelope);
+            toDeliver.push(decryptedPayload);
+          } catch (err) {
+            console.error(`[OfflineStore] Decryption failed for reaction record:`, err.message);
+          }
+        }
+
+        if (record.pendingDeviceIds && record.pendingDeviceIds.length > 0) {
+          remaining.push(record);
+        }
+      } else {
+        remaining.push(record);
+      }
+    }
+
+    if (toDeliver.length > 0 || remaining.length !== this.reactions.length) {
+      this.reactions = remaining;
+      this.save();
+    }
+
+    return toDeliver;
+  }
+
   getStats() {
     const uniqueRecipients = new Set(this.messages.map(m => m.recipient));
     return {
       pendingMessagesCount: this.messages.length,
       pendingStatusesCount: this.statuses.length,
+      pendingReactionsCount: this.reactions.length,
       pendingRecipientsCount: uniqueRecipients.size
     };
   }
@@ -230,6 +306,11 @@ class OfflineStore {
         target: s.target,
         rawTarget: s.rawTarget,
         timestamp: s.timestamp
+      })),
+      reactions: this.reactions.map(r => ({
+        target: r.target,
+        rawTarget: r.rawTarget,
+        timestamp: r.timestamp
       }))
     };
   }
@@ -237,6 +318,7 @@ class OfflineStore {
   clearAll() {
     this.messages = [];
     this.statuses = [];
+    this.reactions = [];
     this.save();
   }
 }

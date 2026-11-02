@@ -2,10 +2,13 @@ const WebSocket = require('ws');
 const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
+const { spawn } = require('child_process');
 const offlineStore = require('./offlineStore');
 
 const SERVER_URL = process.env.SERVER_URL || 'ws://localhost:8080';
 const VAULT_FILE = path.join(__dirname, 'data', 'offline_vault.json');
+
+let spawnedServer = null;
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -19,7 +22,31 @@ function connectSocket(url) {
   });
 }
 
+async function ensureServerRunning() {
+  try {
+    const ws = await connectSocket(SERVER_URL);
+    ws.close();
+    return;
+  } catch (e) {
+    console.log('[Test Suite] Local server not running. Spawning server.js...');
+    spawnedServer = spawn(process.execPath, [path.join(__dirname, 'server.js')], {
+      stdio: 'inherit'
+    });
+    for (let i = 0; i < 20; i++) {
+      await sleep(250);
+      try {
+        const ws = await connectSocket(SERVER_URL);
+        ws.close();
+        console.log('[Test Suite] server.js successfully spawned and ready.\n');
+        return;
+      } catch (err) {}
+    }
+    throw new Error('Failed to connect to spawned server.js');
+  }
+}
+
 async function runTestSuite() {
+  await ensureServerRunning();
   console.log(`================================================================`);
   console.log(` Starting Stealth Chat End-to-End & Offline Encryption Test Suite`);
   console.log(` Target Server URL: ${SERVER_URL}`);
@@ -345,14 +372,125 @@ async function runTestSuite() {
   carolDev1.close();
   carolDev2.close();
   daveDev1.close();
+  await sleep(300);
+
+  // -------------------------------------------------------------
+  // Test 8: Encrypted Media Upload/Download, HD Metadata Relay & Offline Reactions
+  // -------------------------------------------------------------
+  console.log('\n[Test 8] Testing Encrypted Media Upload/Download, HD Relay & Offline Reactions...');
+  const HTTP_URL = SERVER_URL.replace(/^ws:/, 'http:').replace(/^wss:/, 'https:');
+
+  // 1. Upload Encrypted Binary Media
+  const fakeEncryptedPayload = Buffer.from('AES_256_GCM_ENCRYPTED_MEDIA_BLOB_BYTE_SEQUENCE_' + 'X'.repeat(5000));
+  const uploadRes = await fetch(`${HTTP_URL}/api/media/upload`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/octet-stream' },
+    body: fakeEncryptedPayload
+  });
+  assert(uploadRes.status === 200 || uploadRes.status === 201, `Media upload must return 200/201, got ${uploadRes.status}`);
+  const uploadData = await uploadRes.json();
+  assert(uploadData.success, 'Upload response must be success');
+  assert(uploadData.mediaId, 'Upload response must have mediaId');
+  const testMediaId = uploadData.mediaId;
+  console.log(` -> PASSED: Media binary uploaded successfully! ID: ${testMediaId}`);
+
+  // 2. Download Encrypted Binary Media
+  const downloadRes = await fetch(`${HTTP_URL}/api/media/${testMediaId}`);
+  assert.strictEqual(downloadRes.status, 200, 'Media download must return 200 OK');
+  const downloadedBuffer = Buffer.from(await downloadRes.arrayBuffer());
+  assert(downloadedBuffer.equals(fakeEncryptedPayload), 'Downloaded media must match uploaded ciphertext bit-for-bit');
+  console.log(' -> PASSED: Encrypted media downloaded and verified identical bit-for-bit.');
+
+  // 3. Media Message Relay with HD Metadata
+  let mediaUserA = await connectSocket(SERVER_URL);
+  let mediaUserB = await connectSocket(SERVER_URL);
+
+  let bReceivedMediaMsg = null;
+  mediaUserB.on('message', (raw) => {
+    const msg = JSON.parse(raw.toString());
+    if (msg.type === 'MSG_RELAY' && msg.id === 'msg_media_hd_1') {
+      bReceivedMediaMsg = msg;
+    }
+  });
+
+  mediaUserA.send(JSON.stringify({ type: 'REGISTER', mobile: '+15550008', nickname: 'MediaA' }));
+  mediaUserB.send(JSON.stringify({ type: 'REGISTER', mobile: '+15550009', nickname: 'MediaB' }));
+  await sleep(400);
+
+  mediaUserA.send(JSON.stringify({
+    type: 'SEND_MSG',
+    id: 'msg_media_hd_1',
+    sender: '+15550008',
+    recipient: '+15550009',
+    text: 'Encrypted HD Photo Caption',
+    messageType: 'IMAGE',
+    mediaId: testMediaId,
+    isHd: true,
+    mediaSize: fakeEncryptedPayload.length
+  }));
+  await sleep(500);
+
+  assert(bReceivedMediaMsg !== null, 'Recipient must receive media relay message');
+  assert.strictEqual(bReceivedMediaMsg.messageType, 'IMAGE', 'Message type must be IMAGE');
+  assert.strictEqual(bReceivedMediaMsg.mediaId, testMediaId, 'Media ID must match');
+  assert.strictEqual(bReceivedMediaMsg.isHd, true, 'isHd must be true');
+  assert.strictEqual(bReceivedMediaMsg.mediaSize, fakeEncryptedPayload.length, 'Media size must match');
+  console.log(' -> PASSED: HD Media metadata relayed with high fidelity!');
+
+  // 4. Offline Reaction Queueing and Dequeueing
+  console.log(' -> Testing offline reaction queuing for recipient...');
+  mediaUserB.close();
+  await sleep(300);
+
+  // Send reaction while MediaB is offline
+  mediaUserA.send(JSON.stringify({
+    type: 'MSG_REACTION',
+    id: 'msg_media_hd_1',
+    to: '+15550009',
+    reaction: '🔥'
+  }));
+  await sleep(500);
+
+  // Verify reaction is in offlineStore
+  offlineStore.init();
+  const reactionStats = offlineStore.getStats();
+  assert(reactionStats.pendingReactionsCount >= 1, 'Offline store must hold queued reaction');
+  console.log(` -> PASSED: Offline reaction queued at rest (${reactionStats.pendingReactionsCount} pending).`);
+
+  // MediaB reconnects and flushes vault
+  let bReceivedQueuedReaction = null;
+  mediaUserB = await connectSocket(SERVER_URL);
+  mediaUserB.on('message', (raw) => {
+    const msg = JSON.parse(raw.toString());
+    if (msg.type === 'MSG_REACTION' && msg.id === 'msg_media_hd_1') {
+      bReceivedQueuedReaction = msg;
+    }
+  });
+
+  mediaUserB.send(JSON.stringify({ type: 'REGISTER', mobile: '+15550009', nickname: 'MediaB' }));
+  await sleep(600);
+
+  assert(bReceivedQueuedReaction !== null, 'Reconnected MediaB must receive queued reaction');
+  assert.strictEqual(bReceivedQueuedReaction.reaction, '🔥', 'Delivered reaction emoji must match');
+  console.log(' -> PASSED: Offline reaction successfully delivered upon recipient reconnection!');
+
+  mediaUserA.close();
+  mediaUserB.close();
+
+  if (spawnedServer) {
+    spawnedServer.kill();
+  }
 
   console.log('\n================================================================');
-  console.log(' ALL TESTS PASSED: Offline Message Holding & Multi-Device verified!');
+  console.log(' ALL TESTS PASSED: Offline Message Holding, Media & Multi-Device verified!');
   console.log('================================================================\n');
   process.exit(0);
 }
 
 runTestSuite().catch((err) => {
+  if (spawnedServer) {
+    spawnedServer.kill();
+  }
   console.error('\n[TEST SUITE FAILURE]:', err);
   process.exit(1);
 });
