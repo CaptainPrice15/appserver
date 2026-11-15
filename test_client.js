@@ -78,6 +78,13 @@ async function runTestSuite() {
     const msg = JSON.parse(raw.toString());
     if (msg.type === 'MSG_RELAY') {
       bReceivedDirectMsg = msg;
+      // Send genuine client-side delivery ACK matching Android client implementation
+      phoneB.send(JSON.stringify({
+        type: 'STATUS_UPDATE',
+        id: msg.id,
+        status: 'DELIVERED',
+        to: msg.sender
+      }));
     }
   });
 

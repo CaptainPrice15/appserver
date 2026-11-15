@@ -427,6 +427,11 @@ app.get('/api/vault/flush', (req, res) => {
 
 // WebSocket Real-time Messaging
 wss.on('connection', (ws, req) => {
+  ws.isAlive = true;
+  ws.on('pong', () => {
+    ws.isAlive = true;
+  });
+
   let authenticatedMobile = null;
   let authenticatedDeviceId = null;
   console.log(`[WS] New client connection from ${req.socket.remoteAddress}`);
@@ -596,6 +601,7 @@ wss.on('connection', (ws, req) => {
           // 3. Multi-Device Fan-Out to Recipient
           const recipientSessions = getActiveDeviceSessions(recipient);
           const recipientOfflineDevices = getOfflineDeviceIds(recipient);
+          let deliveredToAnySession = false;
 
           if (recipientSessions.length > 0) {
             for (const rSession of recipientSessions) {
@@ -603,22 +609,22 @@ wss.on('connection', (ws, req) => {
                 // First flush any previously queued vault messages for this recipient device
                 flushVaultForDevice(recipient, rSession.deviceId, rSession.ws);
                 // Deliver message in real-time
-                rSession.ws.send(JSON.stringify(relayPayload));
-                console.log(`[WS] Delivered in real-time to ${recipient} (Device: ${rSession.deviceId})`);
+                rSession.ws.send(JSON.stringify(relayPayload), (err) => {
+                  if (err) {
+                    console.error(`[WS] Failed to deliver real-time to ${recipient} (${rSession.deviceId}):`, err.message);
+                    offlineStore.enqueueMessage(recipient, relayPayload, [rSession.deviceId]);
+                  }
+                });
+                deliveredToAnySession = true;
+                console.log(`[WS] Dispatched in real-time to ${recipient} (Device: ${rSession.deviceId})`);
+              } else {
+                offlineStore.enqueueMessage(recipient, relayPayload, [rSession.deviceId]);
               }
             }
-
-            // Notify sender of delivery
-            ws.send(JSON.stringify({
-              type: 'STATUS_UPDATE',
-              id: messageId,
-              status: 'DELIVERED',
-              recipient
-            }));
           }
 
-          // If recipient has offline devices (or no devices are online at all):
-          if (recipientOfflineDevices.length > 0 || recipientSessions.length === 0) {
+          // If recipient has offline devices or no active sessions delivered:
+          if (recipientOfflineDevices.length > 0 || !deliveredToAnySession) {
             const targets = recipientOfflineDevices.length > 0 ? recipientOfflineDevices : null;
             console.log(`[WS] Recipient ${recipient} has offline devices (${targets ? targets.join(',') : 'all'}). Encrypting and queuing in offline vault.`);
             offlineStore.enqueueMessage(recipient, relayPayload, targets);
@@ -831,6 +837,22 @@ wss.on('connection', (ws, req) => {
   ws.on('error', (err) => {
     console.error(`[WS] Socket error for ${authenticatedMobile}:`, err.message);
   });
+});
+
+// Periodic WebSocket Ping/Pong Heartbeat (every 30 seconds) to purge stale / dead sockets
+const pingInterval = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) {
+      console.log('[WS] Terminating unresponsive/zombie client socket');
+      return ws.terminate();
+    }
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, 30000);
+
+wss.on('close', () => {
+  clearInterval(pingInterval);
 });
 
 server.listen(PORT, '0.0.0.0', () => {
