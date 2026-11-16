@@ -65,25 +65,36 @@ class OfflineStore {
   }
 
   /**
-   * Encrypts and holds a relay message for an offline recipient (optionally targeted to specific device IDs)
+   * Encrypts and holds a relay message for a recipient until delivery is confirmed.
+   * Prevents premature flushing so messages survive offline periods and server restarts.
    */
   enqueueMessage(recipientMobile, relayPayload, targetDeviceIds = null) {
     try {
       const cleanMobile = normalizePhone(recipientMobile);
+      const msgId = relayPayload.id || `msg_${Date.now()}`;
+
+      // Avoid duplicate enqueue if already in vault
+      const existingIdx = this.messages.findIndex(m => m.id === msgId);
+      if (existingIdx >= 0) {
+        return true;
+      }
+
       const envelope = cryptoVault.encryptEnvelope(relayPayload);
       const record = {
-        id: relayPayload.id || `msg_${Date.now()}`,
+        id: msgId,
         recipient: cleanMobile,
         rawRecipient: recipientMobile,
         sender: relayPayload.sender || '',
         timestamp: relayPayload.timestamp || Date.now(),
         pendingDeviceIds: Array.isArray(targetDeviceIds) && targetDeviceIds.length > 0 ? [...targetDeviceIds] : null,
+        delivered: false,
+        deliveredAt: null,
         envelope
       };
 
       this.messages.push(record);
       this.save();
-      console.log(`[OfflineStore] Encrypted & queued offline message ${record.id} for ${cleanMobile} (devices: ${record.pendingDeviceIds ? record.pendingDeviceIds.join(',') : 'all'})`);
+      console.log(`[OfflineStore] Encrypted & stored offline message ${record.id} for ${cleanMobile} (devices: ${record.pendingDeviceIds ? record.pendingDeviceIds.join(',') : 'all'})`);
       return true;
     } catch (err) {
       console.error('[OfflineStore] Failed to enqueue message:', err.message);
@@ -92,27 +103,24 @@ class OfflineStore {
   }
 
   /**
-   * Retrieves, decrypts, and removes pending messages for a recipient device.
-   * Matches both normalized and raw recipient phone number variations.
+   * Retrieves and decrypts pending messages for a recipient without deleting them.
+   * Messages remain safely held in the encrypted vault until delivery is confirmed.
    */
-  dequeueMessages(recipientMobile, deviceId = null) {
+  getPendingMessages(recipientMobile, deviceId = null) {
     const toDeliver = [];
-    const remaining = [];
 
     for (const record of this.messages) {
+      if (record.delivered) continue;
+
       const isMatch = phonesMatch(record.recipient, recipientMobile) ||
                       (record.rawRecipient && phonesMatch(record.rawRecipient, recipientMobile));
 
       if (isMatch) {
         let shouldDeliver = false;
         if (!deviceId || deviceId === 'default' || !record.pendingDeviceIds) {
-          // Legacy, default device, or broadcast to any connecting device
           shouldDeliver = true;
-          record.pendingDeviceIds = null;
         } else if (record.pendingDeviceIds.includes(deviceId)) {
           shouldDeliver = true;
-          // Remove this deviceId from pending list
-          record.pendingDeviceIds = record.pendingDeviceIds.filter(id => id !== deviceId);
         }
 
         if (shouldDeliver) {
@@ -123,23 +131,58 @@ class OfflineStore {
             console.error(`[OfflineStore] Decryption failed for message ${record.id}:`, err.message);
           }
         }
+      }
+    }
 
-        // Keep record if there are still other devices waiting for it
-        if (record.pendingDeviceIds && record.pendingDeviceIds.length > 0) {
+    if (toDeliver.length > 0) {
+      console.log(`[OfflineStore] Retrieved ${toDeliver.length} pending vault messages for ${recipientMobile} (device: ${deviceId || 'any'})`);
+    }
+
+    return toDeliver;
+  }
+
+  /**
+   * Confirms delivery of a message to the recipient's device.
+   * Only after the recipient phone confirms delivery is the message safely purged from the vault.
+   */
+  acknowledgeDelivery(messageId, deviceId = null) {
+    let removed = false;
+    const remaining = [];
+
+    for (const record of this.messages) {
+      if (record.id === messageId) {
+        if (record.pendingDeviceIds && deviceId && record.pendingDeviceIds.length > 1) {
+          record.pendingDeviceIds = record.pendingDeviceIds.filter(id => id !== deviceId);
           remaining.push(record);
+        } else {
+          removed = true;
         }
       } else {
         remaining.push(record);
       }
     }
 
-    if (toDeliver.length > 0 || remaining.length !== this.messages.length) {
+    if (removed) {
       this.messages = remaining;
       this.save();
-      console.log(`[OfflineStore] Dequeued & decrypted ${toDeliver.length} offline messages for ${recipientMobile} (device: ${deviceId || 'any'})`);
+      console.log(`[OfflineStore] Confirmed delivery of message ${messageId}. Safely purged from vault.`);
     }
 
-    return toDeliver;
+    return removed;
+  }
+
+  /**
+   * Checks if a message is currently pending in the offline vault
+   */
+  hasPendingMessage(messageId) {
+    return this.messages.some(m => m.id === messageId && !m.delivered);
+  }
+
+  /**
+   * Backward-compatible alias for retrieving pending messages
+   */
+  dequeueMessages(recipientMobile, deviceId = null) {
+    return this.getPendingMessages(recipientMobile, deviceId);
   }
 
   /**

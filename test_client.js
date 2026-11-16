@@ -46,16 +46,15 @@ async function ensureServerRunning() {
 }
 
 async function runTestSuite() {
+  // Ensure clean testing slate if local
+  if (SERVER_URL.includes('localhost') || SERVER_URL.includes('127.0.0.1')) {
+    offlineStore.clearAll();
+  }
   await ensureServerRunning();
   console.log(`================================================================`);
   console.log(` Starting Stealth Chat End-to-End & Offline Encryption Test Suite`);
   console.log(` Target Server URL: ${SERVER_URL}`);
   console.log(`================================================================\n`);
-
-  // Ensure clean testing slate if local
-  if (SERVER_URL.includes('localhost') || SERVER_URL.includes('127.0.0.1')) {
-    offlineStore.clearAll();
-  }
 
   // -------------------------------------------------------------
   // Test 1: Real-time Online Messaging (Alice -> Bob)
@@ -360,6 +359,12 @@ async function runTestSuite() {
     const msg = JSON.parse(raw.toString());
     if (msg.type === 'MSG_RELAY' && msg.id === 'msg_multi_offline_tablet') {
       tabletQueuedReceived = true;
+      carolDev2.send(JSON.stringify({
+        type: 'STATUS_UPDATE',
+        id: msg.id,
+        status: 'DELIVERED',
+        to: msg.sender
+      }));
     }
   });
 
@@ -417,6 +422,12 @@ async function runTestSuite() {
     const msg = JSON.parse(raw.toString());
     if (msg.type === 'MSG_RELAY' && msg.id === 'msg_media_hd_1') {
       bReceivedMediaMsg = msg;
+      mediaUserB.send(JSON.stringify({
+        type: 'STATUS_UPDATE',
+        id: msg.id,
+        status: 'DELIVERED',
+        to: msg.sender
+      }));
     }
   });
 

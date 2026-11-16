@@ -601,7 +601,10 @@ wss.on('connection', (ws, req) => {
           // 3. Multi-Device Fan-Out to Recipient
           const recipientSessions = getActiveDeviceSessions(recipient);
           const recipientOfflineDevices = getOfflineDeviceIds(recipient);
-          let deliveredToAnySession = false;
+          const targetDevices = recipientOfflineDevices.length > 0 ? recipientOfflineDevices : null;
+
+          // Always hold in encrypted offline store until acknowledged by recipient device
+          offlineStore.enqueueMessage(recipient, relayPayload, targetDevices);
 
           if (recipientSessions.length > 0) {
             for (const rSession of recipientSessions) {
@@ -612,22 +615,11 @@ wss.on('connection', (ws, req) => {
                 rSession.ws.send(JSON.stringify(relayPayload), (err) => {
                   if (err) {
                     console.error(`[WS] Failed to deliver real-time to ${recipient} (${rSession.deviceId}):`, err.message);
-                    offlineStore.enqueueMessage(recipient, relayPayload, [rSession.deviceId]);
                   }
                 });
-                deliveredToAnySession = true;
                 console.log(`[WS] Dispatched in real-time to ${recipient} (Device: ${rSession.deviceId})`);
-              } else {
-                offlineStore.enqueueMessage(recipient, relayPayload, [rSession.deviceId]);
               }
             }
-          }
-
-          // If recipient has offline devices or no active sessions delivered:
-          if (recipientOfflineDevices.length > 0 || !deliveredToAnySession) {
-            const targets = recipientOfflineDevices.length > 0 ? recipientOfflineDevices : null;
-            console.log(`[WS] Recipient ${recipient} has offline devices (${targets ? targets.join(',') : 'all'}). Encrypting and queuing in offline vault.`);
-            offlineStore.enqueueMessage(recipient, relayPayload, targets);
           }
           break;
         }
@@ -641,16 +633,35 @@ wss.on('connection', (ws, req) => {
             from: authenticatedMobile
           };
 
+          // Acknowledge delivery in offline vault if DELIVERED or READ so message is safely purged
+          if (msg.status === 'DELIVERED' || msg.status === 'READ') {
+            offlineStore.acknowledgeDelivery(msg.id, authenticatedDeviceId);
+          }
+
           // 1. Deliver to all online devices of the target sender
           const targetSessions = getActiveDeviceSessions(target);
+          let deliveredToActiveSender = false;
+
           if (targetSessions.length > 0) {
             for (const tSession of targetSessions) {
               if (tSession.ws.readyState === WebSocket.OPEN) {
-                tSession.ws.send(JSON.stringify(statusPayload));
+                tSession.ws.send(JSON.stringify(statusPayload), (err) => {
+                  if (err) {
+                    console.error(`[WS] Failed to deliver status update to ${target}:`, err.message);
+                    offlineStore.enqueueStatus(target, statusPayload);
+                  }
+                });
+                deliveredToActiveSender = true;
+                console.log(`[WS] Delivered ${msg.status} status for ${msg.id} in real-time to sender ${target}`);
               }
             }
-          } else {
-            offlineStore.enqueueStatus(target, statusPayload);
+          }
+
+          // If target sender has offline devices or was not active, queue status in vault
+          const offlineSenderDevices = getOfflineDeviceIds(target);
+          if (!deliveredToActiveSender || offlineSenderDevices.length > 0) {
+            offlineStore.enqueueStatus(target, statusPayload, offlineSenderDevices.length > 0 ? offlineSenderDevices : null);
+            console.log(`[WS] Queued ${msg.status} status receipt for offline sender ${target}`);
           }
 
           // 2. Self-Sync: If READ status, synchronize read receipt to reader's other devices
@@ -665,6 +676,24 @@ wss.on('connection', (ws, req) => {
                   peerMobile: target
                 }));
               }
+            }
+          }
+          break;
+        }
+
+        case 'SYNC_STATUS': {
+          // Sender querying delivery status for messages currently in SENT state
+          const messageIds = Array.isArray(msg.ids) ? msg.ids : [];
+          for (const msgId of messageIds) {
+            const isPending = offlineStore.hasPendingMessage(msgId);
+            if (!isPending) {
+              // Message has been delivered (no longer pending in offline store)
+              ws.send(JSON.stringify({
+                type: 'STATUS_UPDATE',
+                id: msgId,
+                status: 'DELIVERED',
+                from: msg.peerMobile || ''
+              }));
             }
           }
           break;
@@ -863,4 +892,17 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(` Health check: http://localhost:${PORT}/health`);
   console.log(` WebSocket URL: ws://localhost:${PORT}`);
   console.log(`======================================================\n`);
+
+  // Render Free Tier Sleep Prevention: self-ping every 10 minutes if external URL is set
+  const externalUrl = process.env.RENDER_EXTERNAL_URL || process.env.SERVER_URL;
+  if (externalUrl && externalUrl.startsWith('http')) {
+    const keepAliveEndpoint = `${externalUrl.replace(/\/$/, '')}/health`;
+    console.log(`[KeepAlive] Registered Render self-ping keepalive target: ${keepAliveEndpoint}`);
+    setInterval(() => {
+      const pingReq = http.get(keepAliveEndpoint, (res) => {
+        res.resume();
+      });
+      pingReq.on('error', () => {});
+    }, 10 * 60 * 1000); // 10 minutes
+  }
 });
