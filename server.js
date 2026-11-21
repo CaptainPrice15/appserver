@@ -11,6 +11,7 @@ const { normalizePhone, phonesMatch } = require('./phoneUtils');
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.set('trust proxy', 1); // Trust Nginx reverse proxy on OCI
 
 // Media Storage Directory for End-to-End Encrypted Blobs
 const MEDIA_DIR = path.join(__dirname, 'data', 'media');

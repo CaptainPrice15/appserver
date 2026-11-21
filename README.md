@@ -4,63 +4,93 @@ Dedicated WebSocket & HTTP server for the Stealth Minigame Chat Android app.
 
 ---
 
-## 🚀 1. Deploying to Render.com (Global 4G/5G/Wi-Fi Chat)
+## ⚡ Production Deployment: Oracle Cloud Infrastructure (OCI Always Free)
 
-### Option A: Direct from GitHub (Recommended)
-1. Initialize a git repository in this folder and push to GitHub:
-   ```bash
-   git init
-   git add .
-   git commit -m "Initial commit for stealth chat backend"
-   git remote add origin https://github.com/<your-username>/stealth-chat-server.git
-   git push -u origin main
-   ```
-2. Log in to [Render Dashboard](https://dashboard.render.com).
-3. Click **New +** -> **Web Service**.
-4. Connect your GitHub repository.
-5. Set the settings:
-   - **Environment**: `Node`
-   - **Build Command**: `npm install`
-   - **Start Command**: `npm start`
-   - **Plan**: `Free`
-6. Click **Create Web Service**.
-7. Render will provide a public URL like: `https://stealth-chat-xyz.onrender.com`.
-8. Your Android app WebSocket URL is:
-   ```
-   wss://stealth-chat-xyz.onrender.com
-   ```
+Target Domain: `stealth-chat.duckdns.org`  
+Target VM Shape: `VM.Standard.E2.1.Micro` (1 OCPU, 1 GB RAM, Always Free)
 
-### Option B: Using Render Blueprint
-In Render Dashboard, select **New +** -> **Blueprint**, choose your repo, and Render will automatically detect `render.yaml`.
+### Advantages over Render Free Tier:
+- **Zero Sleep**: Runs 24/7 with zero spin-down delays (no 30-60s wakeups).
+- **Persistent Storage**: Offline messages (`data/offline_vault.json`) and media uploads (`data/media`) are preserved across reboots.
+- **Dedicated Reserved IPv4**: Free static IP with SSL/TLS (`wss://`).
+- **PM2 Daemon**: Auto-restart on crash, 450MB memory threshold, and boot-time recovery.
 
 ---
 
-## 💻 2. Running Locally (Local Wi-Fi)
+### Step-by-Step Setup on OCI VM (Ubuntu 22.04 LTS)
+
+#### 1. SSH into your OCI VM
+```bash
+ssh -i /path/to/your_oci_key.key ubuntu@<YOUR_OCI_PUBLIC_IP>
+```
+
+#### 2. Run the 1-Click Bootstrap Script
+```bash
+curl -fsSL https://raw.githubusercontent.com/CaptainPrice15/appserver/main/scripts/setup-oci.sh | bash
+```
+*This creates a 2GB swapfile (protecting against 1GB RAM OOM), installs Node.js 20, PM2, Nginx, Certbot, and opens firewall ports (80, 443, 8080).*
+
+#### 3. Clone / Update Repository
+```bash
+git clone https://github.com/CaptainPrice15/appserver.git ~/chat-server
+cd ~/chat-server
+npm install
+```
+
+#### 4. Start Server with PM2 & Enable Auto-Boot
+```bash
+pm2 start ecosystem.config.js
+pm2 save
+sudo env PATH=$PATH:/usr/bin pm2 startup systemd -u ubuntu --hp /home/ubuntu
+```
+
+#### 5. Configure Nginx Reverse Proxy
+```bash
+sudo cp ~/chat-server/nginx/stealth-chat.conf /etc/nginx/sites-available/stealth-chat.conf
+sudo ln -sf /etc/nginx/sites-available/stealth-chat.conf /etc/nginx/sites-enabled/
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+#### 6. Issue Free Let's Encrypt SSL Certificate
+```bash
+sudo certbot --nginx -d stealth-chat.duckdns.org --non-interactive --agree-tos -m your-email@example.com --redirect
+```
+
+#### 7. Verify Auto-Renewal
+```bash
+sudo certbot renew --dry-run
+```
+
+---
+
+## 💻 Local Wi-Fi Development
 
 1. Install dependencies:
    ```bash
    npm install
    ```
-2. Start the server:
+2. Start server locally:
    ```bash
    npm start
    ```
-3. Find your PC's IP address (`ipconfig` on Windows).
-4. In the Android app Vault Settings, enter:
-   ```
-   ws://<YOUR_PC_IP>:8080
+3. Test locally:
+   ```bash
+   npm test
    ```
 
 ---
 
-## 🧪 3. Testing Real-Time Messaging
+## 🧪 Testing Real-Time Messaging
 
-Run the built-in two-phone simulation test:
+### Test against Local Server:
 ```bash
 node test_client.js
 ```
-Or test against your live Render server:
-```bash
-$env:SERVER_URL="wss://stealth-chat-xyz.onrender.com"
+
+### Test against Live OCI Cloud Server:
+```powershell
+$env:SERVER_URL="wss://stealth-chat.duckdns.org"
 node test_client.js
 ```
