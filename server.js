@@ -404,6 +404,10 @@ app.get('/api/vault/pending', (req, res) => {
   res.json(offlineStore.getPendingOverview());
 });
 
+app.get('/api/vault/all', (req, res) => {
+  res.json(offlineStore.getAllMessagesOverview());
+});
+
 app.get('/api/vault/flush', (req, res) => {
   let totalMessages = 0;
   let totalStatuses = 0;
@@ -603,9 +607,7 @@ wss.on('connection', (ws, req) => {
           const recipientOfflineDevices = getOfflineDeviceIds(recipient);
           const targetDevices = recipientOfflineDevices.length > 0 ? recipientOfflineDevices : null;
 
-          // Always hold in encrypted offline store until acknowledged by recipient device
-          offlineStore.enqueueMessage(recipient, relayPayload, targetDevices);
-
+          // If recipient is online, first flush any older pending offline messages
           if (recipientSessions.length > 0) {
             for (const rSession of recipientSessions) {
               if (rSession.ws.readyState === WebSocket.OPEN) {
@@ -621,6 +623,10 @@ wss.on('connection', (ws, req) => {
               }
             }
           }
+
+          // Always hold in encrypted offline store until acknowledged by recipient device
+          // (Server will NEVER purge the message even after delivery)
+          offlineStore.enqueueMessage(recipient, relayPayload, targetDevices);
           break;
         }
 
@@ -633,9 +639,9 @@ wss.on('connection', (ws, req) => {
             from: authenticatedMobile
           };
 
-          // Acknowledge delivery in offline vault if DELIVERED or READ so message is safely purged
+          // Acknowledge delivery in offline vault if DELIVERED or READ (marked delivered without purging; undelivered messages are never purged)
           if (msg.status === 'DELIVERED' || msg.status === 'READ') {
-            offlineStore.acknowledgeDelivery(msg.id, authenticatedDeviceId);
+            offlineStore.acknowledgeDelivery(msg.id, authenticatedDeviceId, authenticatedMobile);
           }
 
           // 1. Deliver to all online devices of the target sender

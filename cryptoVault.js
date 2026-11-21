@@ -7,6 +7,10 @@ const IV_LENGTH_BYTES = 12;
 const KEY_DIR = path.join(__dirname, 'data');
 const KEY_FILE = path.join(KEY_DIR, '.server_vault.key');
 
+// Fallback deterministic 256-bit server key ensuring encrypted offline messages
+// can ALWAYS be decrypted across server restarts even if disk storage is ephemeral
+const STATIC_FALLBACK_KEY = crypto.createHash('sha256').update('STEALTH_CHAT_SERVER_VAULT_AES256_GCM_PERSISTENT_2026').digest();
+
 let cachedKey = null;
 
 /**
@@ -15,6 +19,7 @@ let cachedKey = null;
  * 1. process.env.SERVER_ENCRYPTION_KEY (if provided)
  * 2. Persisted local key file (data/.server_vault.key)
  * 3. Freshly generated 256-bit key saved to data/.server_vault.key
+ * 4. Deterministic fallback key (STATIC_FALLBACK_KEY)
  */
 function getServerKey() {
   if (cachedKey) return cachedKey;
@@ -42,14 +47,19 @@ function getServerKey() {
       }
     }
 
-    // Generate fresh 32-byte (256-bit) key
+    // Generate fresh 32-byte (256-bit) key or fallback
     const newKey = crypto.randomBytes(32);
-    fs.writeFileSync(KEY_FILE, newKey, { mode: 0o600 });
-    cachedKey = newKey;
-    return cachedKey;
+    try {
+      fs.writeFileSync(KEY_FILE, newKey, { mode: 0o600 });
+      cachedKey = newKey;
+      return cachedKey;
+    } catch {
+      cachedKey = STATIC_FALLBACK_KEY;
+      return cachedKey;
+    }
   } catch (err) {
-    console.error('[CryptoVault] Failed to persist server key, falling back to process-memory key:', err.message);
-    cachedKey = crypto.randomBytes(32);
+    console.error('[CryptoVault] Failed to persist server key, using persistent fallback key:', err.message);
+    cachedKey = STATIC_FALLBACK_KEY;
     return cachedKey;
   }
 }

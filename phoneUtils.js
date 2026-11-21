@@ -50,6 +50,11 @@ function phonesMatch(phone1, phone2) {
     if (d1.slice(-10) === d2.slice(-10)) return true;
   }
 
+  // Flexible suffix matching for numbers with country code or prefix differences (min 7 digits)
+  if (d1.length >= 7 && d2.length >= 7) {
+    if (d1.endsWith(d2) || d2.endsWith(d1)) return true;
+  }
+
   return false;
 }
 

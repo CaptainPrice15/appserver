@@ -214,11 +214,12 @@ async function runTestSuite() {
 
   console.log(' -> PASSED: Bob successfully received and decrypted all offline held messages upon reconnecting!');
 
-  // Verify vault has dequeued the delivered messages
-  offlineStore.init(); // Reload from disk to observe server's dequeue
+  // Verify vault has marked the delivered messages as delivered without purging them
+  offlineStore.init(); // Reload from disk to observe server's update
   const remainingStats = offlineStore.getStats();
-  assert.strictEqual(remainingStats.pendingMessagesCount, 0, 'Vault must safely purge delivered messages');
-  console.log(' -> PASSED: Delivered messages safely purged from the server vault.');
+  assert.strictEqual(remainingStats.pendingMessagesCount, 0, 'Pending messages count must be 0 after delivery');
+  assert(remainingStats.totalStoredMessagesCount >= 2, 'Server must NOT purge delivered messages; messages must be retained in vault');
+  console.log(' -> PASSED: Delivered messages confirmed and safely retained in server vault without purging.');
 
   // Clean up Test 1-4 sockets
   phoneA.close();
@@ -494,6 +495,221 @@ async function runTestSuite() {
 
   mediaUserA.close();
   mediaUserB.close();
+  await sleep(300);
+
+  // -------------------------------------------------------------
+  // Test 9: Online Message Receipt Without Saved Contact & Offline Hold with Zero Purge
+  // -------------------------------------------------------------
+  console.log('\n[Test 9] Testing Online Delivery (Unsaved Sender) & Offline Holding with No Purging...');
+  const phoneUnsavedA = await connectSocket(SERVER_URL);
+  let phoneUnsavedB = await connectSocket(SERVER_URL);
+
+  let bReceivedDirectMsg9 = null;
+  phoneUnsavedB.on('message', (raw) => {
+    const msg = JSON.parse(raw.toString());
+    if (msg.type === 'MSG_RELAY' && msg.id === 'msg_unsaved_test_1') {
+      bReceivedDirectMsg9 = msg;
+      phoneUnsavedB.send(JSON.stringify({
+        type: 'STATUS_UPDATE',
+        id: msg.id,
+        status: 'DELIVERED',
+        to: msg.sender
+      }));
+    }
+  });
+
+  // Phone B registers with their phone number (+91 98765 43210). Phone B has NOT saved Phone A.
+  phoneUnsavedB.send(JSON.stringify({
+    type: 'REGISTER',
+    mobile: '+919876543210',
+    nickname: 'RecipientPhoneB',
+    deviceId: 'phone_b_dev_1'
+  }));
+
+  // Phone A registers with their phone number
+  phoneUnsavedA.send(JSON.stringify({
+    type: 'REGISTER',
+    mobile: '9579160314',
+    nickname: 'SenderPhoneA',
+    deviceId: 'phone_a_dev_1'
+  }));
+  await sleep(400);
+
+  // Phone A sends message to Phone B
+  phoneUnsavedA.send(JSON.stringify({
+    type: 'SEND_MSG',
+    id: 'msg_unsaved_test_1',
+    sender: '9579160314',
+    recipient: '9876543210',
+    text: 'EncryptedHello_UnsavedSender'
+  }));
+  await sleep(500);
+
+  assert(bReceivedDirectMsg9 !== null, 'Recipient Phone B must receive message when online even if sender is unsaved');
+  assert.strictEqual(bReceivedDirectMsg9.text, 'EncryptedHello_UnsavedSender');
+  console.log(' -> PASSED: Online recipient received message from unsaved sender immediately.');
+
+  // Now Phone B goes offline
+  phoneUnsavedB.close();
+  phoneUnsavedB = null;
+  await sleep(300);
+
+  // Phone A sends a 2nd message while Phone B is offline
+  phoneUnsavedA.send(JSON.stringify({
+    type: 'SEND_MSG',
+    id: 'msg_unsaved_test_2',
+    sender: '9579160314',
+    recipient: '9876543210',
+    text: 'HeldInVaultUntilPhoneBComesOnline'
+  }));
+  await sleep(400);
+
+  // Verify server holds the message in offlineStore
+  offlineStore.init();
+  assert(offlineStore.hasPendingMessage('msg_unsaved_test_2'), 'Server must hold un-delivered message in vault while 2nd phone is offline');
+  console.log(' -> PASSED: Server is actively holding offline message in encrypted vault.');
+
+  // 2nd Phone comes back online
+  let bReceivedHeldMsg = null;
+  phoneUnsavedB = await connectSocket(SERVER_URL);
+  phoneUnsavedB.on('message', (raw) => {
+    const msg = JSON.parse(raw.toString());
+    if (msg.type === 'MSG_RELAY' && msg.id === 'msg_unsaved_test_2') {
+      bReceivedHeldMsg = msg;
+      phoneUnsavedB.send(JSON.stringify({
+        type: 'STATUS_UPDATE',
+        id: msg.id,
+        status: 'DELIVERED',
+        to: msg.sender
+      }));
+    }
+  });
+
+  // Re-register Phone B
+  phoneUnsavedB.send(JSON.stringify({
+    type: 'REGISTER',
+    mobile: '9876543210',
+    nickname: 'RecipientPhoneB',
+    deviceId: 'phone_b_dev_1'
+  }));
+  await sleep(600);
+
+  assert(bReceivedHeldMsg !== null, '2nd phone must receive held message upon coming back online');
+  assert.strictEqual(bReceivedHeldMsg.text, 'HeldInVaultUntilPhoneBComesOnline');
+  console.log(' -> PASSED: Held message delivered to 2nd phone upon reconnecting.');
+
+  // Verify server DID NOT PURGE the message!
+  offlineStore.init();
+  const diskVault = JSON.parse(fs.readFileSync(VAULT_FILE, 'utf8'));
+  const storedRecord = diskVault.messages.find(m => m.id === 'msg_unsaved_test_2');
+  assert(storedRecord !== undefined, 'CRITICAL: Server must NOT purge message after delivery! Record must remain in vault.');
+  assert.strictEqual(storedRecord.delivered, true, 'Stored record must be marked delivered');
+  console.log(' -> PASSED: Server retained message in encrypted vault without purging!');
+
+  phoneUnsavedA.close();
+  phoneUnsavedB.close();
+  await sleep(300);
+
+  // Test 10: Explicit Guarantee that Undelivered Messages are NEVER Purged
+  console.log('\n[Test 10] Testing Server Guarantee: Undelivered Messages are NEVER Purged...');
+  const clientA10 = await connectSocket(SERVER_URL);
+  clientA10.send(JSON.stringify({
+    type: 'REGISTER',
+    mobile: '9579160314',
+    nickname: 'SenderA10',
+    deviceId: 'phone_a_dev_10'
+  }));
+  await sleep(300);
+
+  // Recipient B is OFFLINE
+  // Alice sends an offline message
+  clientA10.send(JSON.stringify({
+    type: 'SEND_MSG',
+    id: 'msg_undelivered_test_10',
+    sender: '9579160314',
+    recipient: '9876543210',
+    text: 'NeverPurgeUndeliveredMessage',
+    timestamp: Date.now()
+  }));
+  await sleep(500);
+
+  // Reload offline vault to verify disk persistence
+  offlineStore.init();
+  let vaultAfterSend = JSON.parse(fs.readFileSync(VAULT_FILE, 'utf8'));
+  let undeliveredRecord = vaultAfterSend.messages.find(m => m.id === 'msg_undelivered_test_10' && m.recipient === '9876543210');
+  assert(undeliveredRecord !== undefined, 'Undelivered message must be stored in encrypted vault');
+  assert.strictEqual(undeliveredRecord.delivered, false, 'Undelivered message must have delivered = false');
+  console.log(' -> PASSED: Undelivered message safely held in vault with delivered=false.');
+
+  // Recipient B connects, receives queued message, but DROPS connection before sending DELIVERED ack
+  let clientB10 = await connectSocket(SERVER_URL);
+  let b10ReceivedMsg = null;
+  clientB10.on('message', (raw) => {
+    const msg = JSON.parse(raw.toString());
+    if (msg.type === 'MSG_RELAY' && msg.id === 'msg_undelivered_test_10') {
+      b10ReceivedMsg = msg;
+    }
+  });
+
+  clientB10.send(JSON.stringify({
+    type: 'REGISTER',
+    mobile: '9876543210',
+    nickname: 'RecipientB10',
+    deviceId: 'phone_b_dev_10'
+  }));
+  await sleep(500);
+
+  assert(b10ReceivedMsg !== null, 'Recipient must receive queued message on connect');
+  // Immediately kill client B connection WITHOUT sending delivery receipt (simulates crash/battery death)
+  clientB10.close();
+  await sleep(300);
+
+  // Check vault again: because no delivery receipt was received, message MUST STILL be undelivered and NOT purged!
+  offlineStore.init();
+  let vaultAfterDrop = JSON.parse(fs.readFileSync(VAULT_FILE, 'utf8'));
+  let droppedRecord = vaultAfterDrop.messages.find(m => m.id === 'msg_undelivered_test_10' && m.recipient === '9876543210');
+  assert(droppedRecord !== undefined, 'CRITICAL: Undelivered message MUST NOT be purged after dropped socket!');
+  assert.strictEqual(droppedRecord.delivered, false, 'Undelivered message must remain delivered=false when unacknowledged');
+  console.log(' -> PASSED: Server NEVER purges unacknowledged message; held permanently in vault.');
+
+  // Recipient B comes back online and finally sends DELIVERED receipt
+  let clientB10Reconnected = await connectSocket(SERVER_URL);
+  let b10ReconnectedMsg = null;
+  clientB10Reconnected.on('message', (raw) => {
+    const msg = JSON.parse(raw.toString());
+    if (msg.type === 'MSG_RELAY' && msg.id === 'msg_undelivered_test_10') {
+      b10ReconnectedMsg = msg;
+      // Now acknowledge delivery
+      clientB10Reconnected.send(JSON.stringify({
+        type: 'STATUS_UPDATE',
+        id: msg.id,
+        status: 'DELIVERED',
+        to: msg.sender
+      }));
+    }
+  });
+
+  clientB10Reconnected.send(JSON.stringify({
+    type: 'REGISTER',
+    mobile: '9876543210',
+    nickname: 'RecipientB10',
+    deviceId: 'phone_b_dev_10'
+  }));
+  await sleep(600);
+
+  assert(b10ReconnectedMsg !== null, 'Recipient must re-receive unacknowledged message on reconnect');
+
+  // Verify vault: now marked delivered, but STILL NEVER PURGED!
+  offlineStore.init();
+  let vaultFinal = JSON.parse(fs.readFileSync(VAULT_FILE, 'utf8'));
+  let finalRecord = vaultFinal.messages.find(m => m.id === 'msg_undelivered_test_10' && m.recipient === '9876543210');
+  assert(finalRecord !== undefined, 'CRITICAL: Server must retain message in vault even after delivery!');
+  assert.strictEqual(finalRecord.delivered, true, 'Message is now marked delivered');
+  console.log(' -> PASSED: Complete undelivered message lifecycle verified: NEVER purged at rest or in transit!');
+
+  clientA10.close();
+  clientB10Reconnected.close();
+  await sleep(300);
 
   if (spawnedServer) {
     spawnedServer.kill();

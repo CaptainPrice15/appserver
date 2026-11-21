@@ -5,6 +5,7 @@ const { normalizePhone, phonesMatch } = require('./phoneUtils');
 
 const DATA_DIR = path.join(__dirname, 'data');
 const STORE_FILE = path.join(DATA_DIR, 'offline_vault.json');
+const BACKUP_FILE = path.join(DATA_DIR, 'offline_vault.json.bak');
 const TMP_FILE = path.join(DATA_DIR, 'offline_vault.tmp');
 
 class OfflineStore {
@@ -29,15 +30,41 @@ class OfflineStore {
         this.statuses = Array.isArray(data.statuses) ? data.statuses : [];
         this.reactions = Array.isArray(data.reactions) ? data.reactions : [];
         console.log(`[OfflineStore] Loaded encrypted store: ${this.messages.length} messages, ${this.statuses.length} status receipts, ${this.reactions.length} reactions pending`);
+        // Sync backup copy
+        try { fs.copyFileSync(STORE_FILE, BACKUP_FILE); } catch (_) {}
+      } else if (fs.existsSync(BACKUP_FILE)) {
+        const raw = fs.readFileSync(BACKUP_FILE, 'utf8');
+        const data = JSON.parse(raw);
+        this.messages = Array.isArray(data.messages) ? data.messages : [];
+        this.statuses = Array.isArray(data.statuses) ? data.statuses : [];
+        this.reactions = Array.isArray(data.reactions) ? data.reactions : [];
+        console.log(`[OfflineStore] Recovered encrypted store from backup: ${this.messages.length} messages`);
+        this.save();
       } else {
         this.save();
       }
       this.initialized = true;
     } catch (err) {
-      console.error('[OfflineStore] Failed to initialize store, starting with empty state:', err.message);
-      this.messages = [];
-      this.statuses = [];
-      this.reactions = [];
+      console.error('[OfflineStore] Failed to initialize from primary store, attempting backup:', err.message);
+      try {
+        if (fs.existsSync(BACKUP_FILE)) {
+          const raw = fs.readFileSync(BACKUP_FILE, 'utf8');
+          const data = JSON.parse(raw);
+          this.messages = Array.isArray(data.messages) ? data.messages : [];
+          this.statuses = Array.isArray(data.statuses) ? data.statuses : [];
+          this.reactions = Array.isArray(data.reactions) ? data.reactions : [];
+          console.log(`[OfflineStore] Successfully recovered ${this.messages.length} messages from backup.`);
+        } else {
+          this.messages = [];
+          this.statuses = [];
+          this.reactions = [];
+        }
+      } catch (backupErr) {
+        console.error('[OfflineStore] Backup recovery failed:', backupErr.message);
+        this.messages = [];
+        this.statuses = [];
+        this.reactions = [];
+      }
       this.initialized = true;
     }
   }
@@ -57,8 +84,20 @@ class OfflineStore {
       };
 
       const jsonStr = JSON.stringify(payload, null, 2);
-      fs.writeFileSync(TMP_FILE, jsonStr, 'utf8');
-      fs.renameSync(TMP_FILE, STORE_FILE);
+      const uniqueTmp = path.join(DATA_DIR, `.offline_vault_${Date.now()}_${process.pid}_${Math.random().toString(36).substring(2, 7)}.tmp`);
+      try {
+        fs.writeFileSync(uniqueTmp, jsonStr, 'utf8');
+        fs.renameSync(uniqueTmp, STORE_FILE);
+      } catch (renameErr) {
+        // Fallback to direct atomic write on Windows
+        try { if (fs.existsSync(uniqueTmp)) fs.unlinkSync(uniqueTmp); } catch (_) {}
+        fs.writeFileSync(STORE_FILE, jsonStr, 'utf8');
+      }
+
+      // Update safety backup file to prevent loss of undelivered messages
+      try {
+        fs.copyFileSync(STORE_FILE, BACKUP_FILE);
+      } catch (_) {}
     } catch (err) {
       console.error('[OfflineStore] Error saving store to disk:', err.message);
     }
@@ -73,8 +112,8 @@ class OfflineStore {
       const cleanMobile = normalizePhone(recipientMobile);
       const msgId = relayPayload.id || `msg_${Date.now()}`;
 
-      // Avoid duplicate enqueue if already in vault
-      const existingIdx = this.messages.findIndex(m => m.id === msgId);
+      // Avoid duplicate enqueue if already in vault for this recipient
+      const existingIdx = this.messages.findIndex(m => m.id === msgId && (phonesMatch(m.recipient, cleanMobile) || (m.rawRecipient && phonesMatch(m.rawRecipient, cleanMobile))));
       if (existingIdx >= 0) {
         return true;
       }
@@ -121,6 +160,9 @@ class OfflineStore {
           shouldDeliver = true;
         } else if (record.pendingDeviceIds.includes(deviceId)) {
           shouldDeliver = true;
+        } else {
+          // Deliver to any authenticated active session belonging to this recipient
+          shouldDeliver = true;
         }
 
         if (shouldDeliver) {
@@ -143,39 +185,56 @@ class OfflineStore {
 
   /**
    * Confirms delivery of a message to the recipient's device.
-   * Only after the recipient phone confirms delivery is the message safely purged from the vault.
+   * Marks the message as delivered so it is not re-sent, but holds it safely in the vault without purging.
+   * Guarantees: Undelivered messages are NEVER purged. Delivered messages are permanently retained at rest.
    */
-  acknowledgeDelivery(messageId, deviceId = null) {
-    let removed = false;
-    const remaining = [];
+  acknowledgeDelivery(messageId, deviceId = null, recipientMobile = null) {
+    let acknowledged = false;
 
     for (const record of this.messages) {
       if (record.id === messageId) {
+        if (recipientMobile) {
+          const isMatch = phonesMatch(record.recipient, recipientMobile) ||
+                          (record.rawRecipient && phonesMatch(record.rawRecipient, recipientMobile));
+          if (!isMatch) continue;
+        }
+
         if (record.pendingDeviceIds && deviceId && record.pendingDeviceIds.length > 1) {
           record.pendingDeviceIds = record.pendingDeviceIds.filter(id => id !== deviceId);
-          remaining.push(record);
+          record.deliveredDevices = record.deliveredDevices || [];
+          if (!record.deliveredDevices.includes(deviceId)) {
+            record.deliveredDevices.push(deviceId);
+          }
         } else {
-          removed = true;
+          record.delivered = true;
+          record.deliveredAt = Date.now();
+          record.deliveredDeviceId = deviceId;
+          record.pendingDeviceIds = null;
+          acknowledged = true;
         }
-      } else {
-        remaining.push(record);
       }
     }
 
-    if (removed) {
-      this.messages = remaining;
+    if (acknowledged) {
       this.save();
-      console.log(`[OfflineStore] Confirmed delivery of message ${messageId}. Safely purged from vault.`);
+      console.log(`[OfflineStore] Confirmed delivery of message ${messageId} to device ${deviceId || 'any'}. Safely retained in encrypted vault (server does NOT purge).`);
     }
 
-    return removed;
+    return acknowledged;
   }
 
   /**
    * Checks if a message is currently pending in the offline vault
    */
-  hasPendingMessage(messageId) {
-    return this.messages.some(m => m.id === messageId && !m.delivered);
+  hasPendingMessage(messageId, recipientMobile = null) {
+    return this.messages.some(m => {
+      if (m.id !== messageId || m.delivered) return false;
+      if (recipientMobile) {
+        return phonesMatch(m.recipient, recipientMobile) ||
+               (m.rawRecipient && phonesMatch(m.rawRecipient, recipientMobile));
+      }
+      return true;
+    });
   }
 
   /**
@@ -327,9 +386,12 @@ class OfflineStore {
   }
 
   getStats() {
-    const uniqueRecipients = new Set(this.messages.map(m => m.recipient));
+    const pendingMessages = this.messages.filter(m => !m.delivered);
+    const uniqueRecipients = new Set(pendingMessages.map(m => m.recipient));
     return {
-      pendingMessagesCount: this.messages.length,
+      totalStoredMessagesCount: this.messages.length,
+      pendingMessagesCount: pendingMessages.length,
+      deliveredMessagesCount: this.messages.length - pendingMessages.length,
       pendingStatusesCount: this.statuses.length,
       pendingReactionsCount: this.reactions.length,
       pendingRecipientsCount: uniqueRecipients.size
@@ -337,13 +399,15 @@ class OfflineStore {
   }
 
   getPendingOverview() {
+    const pending = this.messages.filter(m => !m.delivered);
     return {
-      messages: this.messages.map(m => ({
+      messages: pending.map(m => ({
         id: m.id,
         recipient: m.recipient,
         rawRecipient: m.rawRecipient,
         sender: m.sender,
-        timestamp: m.timestamp
+        timestamp: m.timestamp,
+        delivered: m.delivered
       })),
       statuses: this.statuses.map(s => ({
         target: s.target,
@@ -354,6 +418,22 @@ class OfflineStore {
         target: r.target,
         rawTarget: r.rawTarget,
         timestamp: r.timestamp
+      }))
+    };
+  }
+
+  getAllMessagesOverview() {
+    return {
+      totalMessages: this.messages.length,
+      messages: this.messages.map(m => ({
+        id: m.id,
+        recipient: m.recipient,
+        rawRecipient: m.rawRecipient,
+        sender: m.sender,
+        timestamp: m.timestamp,
+        delivered: !!m.delivered,
+        deliveredAt: m.deliveredAt || null,
+        deliveredDeviceId: m.deliveredDeviceId || null
       }))
     };
   }
