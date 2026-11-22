@@ -216,19 +216,19 @@ app.get('/', (req, res) => {
 
     <div class="stats-grid">
       <div class="stat-card">
-        <div class="stat-val">${activeClients.size}</div>
+        <div class="stat-val" id="stat-active">${activeClients.size}</div>
         <div class="stat-lbl">Active Phones Online</div>
       </div>
       <div class="stat-card">
-        <div class="stat-val">${registeredUsers.size}</div>
+        <div class="stat-val" id="stat-registered">${registeredUsers.size}</div>
         <div class="stat-lbl">Registered Devices</div>
       </div>
       <div class="stat-card">
-        <div class="stat-val">${vaultStats.pendingMessagesCount}</div>
+        <div class="stat-val" id="stat-pending">${vaultStats.pendingMessagesCount}</div>
         <div class="stat-lbl">Offline Messages in Vault</div>
       </div>
       <div class="stat-card">
-        <div class="stat-val">${vaultStats.pendingStatusesCount}</div>
+        <div class="stat-val" id="stat-receipts">${vaultStats.pendingStatusesCount}</div>
         <div class="stat-lbl">Queued Delivery Receipts</div>
       </div>
     </div>
@@ -237,6 +237,24 @@ app.get('/', (req, res) => {
       JSON Health Probe: <a href="/health">/health</a> • Build: Production Ready
     </div>
   </div>
+  <script>
+    setInterval(async () => {
+      try {
+        const res = await fetch('/health');
+        if (res.ok) {
+          const data = await res.json();
+          const activeEl = document.getElementById('stat-active');
+          const regEl = document.getElementById('stat-registered');
+          const pendingEl = document.getElementById('stat-pending');
+          const receiptsEl = document.getElementById('stat-receipts');
+          if (activeEl && data.activeConnections !== undefined) activeEl.textContent = data.activeConnections;
+          if (regEl && data.registeredDevicesCount !== undefined) regEl.textContent = data.registeredDevicesCount;
+          if (pendingEl && data.offlineMessagesCount !== undefined) pendingEl.textContent = data.offlineMessagesCount;
+          if (receiptsEl && data.offlineStatusesCount !== undefined) receiptsEl.textContent = data.offlineStatusesCount;
+        }
+      } catch (_) {}
+    }, 2500);
+  </script>
 </body>
 </html>`);
 });
