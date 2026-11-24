@@ -19,6 +19,49 @@ if (!fs.existsSync(MEDIA_DIR)) {
   fs.mkdirSync(MEDIA_DIR, { recursive: true });
 }
 
+// Private Vault Media Directory for Zero-Disk Cloud Storage
+const VAULT_MEDIA_DIR = path.join(__dirname, 'data', 'vault_media');
+if (!fs.existsSync(VAULT_MEDIA_DIR)) {
+  fs.mkdirSync(VAULT_MEDIA_DIR, { recursive: true });
+}
+const VAULT_METADATA_FILE = path.join(__dirname, 'data', 'vault_metadata.json');
+
+// Memory store for Private Vault metadata: mobile -> Map<itemId, metadata>
+const vaultRegistry = new Map();
+
+function loadVaultMetadata() {
+  try {
+    if (fs.existsSync(VAULT_METADATA_FILE)) {
+      const data = JSON.parse(fs.readFileSync(VAULT_METADATA_FILE, 'utf8'));
+      for (const [mobile, items] of Object.entries(data)) {
+        const itemMap = new Map();
+        if (Array.isArray(items)) {
+          for (const it of items) {
+            itemMap.set(it.id, it);
+          }
+        }
+        vaultRegistry.set(normalizePhone(mobile), itemMap);
+      }
+      console.log(`[Vault] Loaded metadata for ${vaultRegistry.size} accounts`);
+    }
+  } catch (e) {
+    console.error('[Vault] Error loading vault metadata:', e.message);
+  }
+}
+
+function persistVaultMetadata() {
+  try {
+    const out = {};
+    for (const [mobile, itemMap] of vaultRegistry.entries()) {
+      out[mobile] = Array.from(itemMap.values());
+    }
+    fs.writeFileSync(VAULT_METADATA_FILE, JSON.stringify(out, null, 2), 'utf8');
+  } catch (e) {
+    console.error('[Vault] Error persisting vault metadata:', e.message);
+  }
+}
+loadVaultMetadata();
+
 // Render sets PORT automatically (e.g., 10000); default to 8080 locally
 const PORT = process.env.PORT || 8080;
 const server = http.createServer(app);
@@ -416,6 +459,194 @@ app.delete('/api/media/:mediaId', (req, res) => {
     return res.json({ success: true, mediaId: sanitizedId });
   }
   res.status(404).json({ error: 'Media not found' });
+});
+
+// ==============================================================================
+// Personal Encrypted Private Vault REST Endpoints (Zero-Disk Cloud Storage)
+// ==============================================================================
+app.post('/api/vault/media/upload', express.raw({ type: '*/*', limit: '100mb' }), (req, res) => {
+  const mobile = req.headers['x-mobile'] || req.query.mobile;
+  const cleanMobile = normalizePhone(mobile);
+  if (!cleanMobile) {
+    return res.status(400).json({ error: 'Valid mobile number required in x-mobile header or query' });
+  }
+
+  if (!req.body || req.body.length === 0) {
+    return res.status(400).json({ error: 'No media payload provided' });
+  }
+
+  const deviceId = req.headers['x-device-id'] || req.query.deviceId || 'unknown';
+  const mediaType = (req.headers['x-media-type'] || req.query.mediaType || 'IMAGE').toString().toUpperCase();
+  const rawFileName = req.headers['x-file-name'] || req.query.fileName || `vault_${Date.now()}`;
+  let fileName = rawFileName;
+  try {
+    fileName = decodeURIComponent(rawFileName);
+  } catch (_) {}
+  const durationSec = parseInt(req.headers['x-duration-sec'] || req.query.durationSec || '0', 10);
+
+  const itemId = `vlt_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+  const filePath = path.join(VAULT_MEDIA_DIR, `${itemId}.enc`);
+
+  fs.writeFile(filePath, req.body, (err) => {
+    if (err) {
+      console.error('[Vault] Failed to save encrypted vault item:', err.message);
+      return res.status(500).json({ error: 'Failed to write media to vault storage' });
+    }
+
+    const item = {
+      id: itemId,
+      ownerMobile: cleanMobile,
+      uploaderDeviceId: deviceId,
+      mediaType: (mediaType === 'VIDEO') ? 'VIDEO' : 'IMAGE',
+      fileName,
+      fileSize: req.body.length,
+      durationSec: isNaN(durationSec) ? 0 : durationSec,
+      createdAt: Date.now()
+    };
+
+    if (!vaultRegistry.has(cleanMobile)) {
+      vaultRegistry.set(cleanMobile, new Map());
+    }
+    vaultRegistry.get(cleanMobile).set(itemId, item);
+    persistVaultMetadata();
+
+    console.log(`[Vault] New item stored: ${itemId} (${item.mediaType}, ${item.fileSize} bytes) by ${cleanMobile} [Device: ${deviceId}]`);
+
+    // Broadcast real-time sync event to all active linked devices of this user
+    const activeSessions = getActiveDeviceSessions(cleanMobile);
+    for (const session of activeSessions) {
+      if (session.ws && session.ws.readyState === WebSocket.OPEN) {
+        session.ws.send(JSON.stringify({
+          type: 'VAULT_ITEM_ADDED',
+          item
+        }));
+      }
+    }
+
+    res.json({ success: true, item });
+  });
+});
+
+app.get('/api/vault/media/list', (req, res) => {
+  const mobile = req.query.mobile || req.headers['x-mobile'];
+  const cleanMobile = normalizePhone(mobile);
+  if (!cleanMobile) {
+    return res.status(400).json({ error: 'Valid mobile number required' });
+  }
+
+  const itemsMap = vaultRegistry.get(cleanMobile);
+  const items = itemsMap ? Array.from(itemsMap.values()).sort((a, b) => b.createdAt - a.createdAt) : [];
+  res.json({
+    success: true,
+    mobile: cleanMobile,
+    count: items.length,
+    items
+  });
+});
+
+app.get('/api/vault/media/:mediaId', (req, res) => {
+  const rawId = req.params.mediaId || '';
+  const sanitizedId = rawId.replace(/[^a-zA-Z0-9_-]/g, '');
+  if (!sanitizedId) {
+    return res.status(400).json({ error: 'Invalid media ID' });
+  }
+
+  let filePath = path.join(VAULT_MEDIA_DIR, `${sanitizedId}.enc`);
+  if (!fs.existsSync(filePath)) {
+    // Fallback check in standard media dir
+    const fallbackPath = path.join(MEDIA_DIR, `${sanitizedId}.enc`);
+    if (fs.existsSync(fallbackPath)) {
+      filePath = fallbackPath;
+    } else {
+      return res.status(404).json({ error: 'Vault media not found' });
+    }
+  }
+
+  const stat = fs.statSync(filePath);
+  const fileSize = stat.size;
+  const range = req.headers.range;
+
+  res.setHeader('Accept-Ranges', 'bytes');
+  res.setHeader('Content-Type', 'application/octet-stream');
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate'); // Zero persistence guarantee
+
+  if (range) {
+    const parts = range.replace(/bytes=/, "").split("-");
+    const start = parseInt(parts[0], 10);
+    const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+
+    if (start >= fileSize || end >= fileSize) {
+      res.setHeader('Content-Range', `bytes */${fileSize}`);
+      return res.status(416).end();
+    }
+
+    const chunksize = (end - start) + 1;
+    const file = fs.createReadStream(filePath, { start, end });
+    res.writeHead(206, {
+      'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+      'Content-Length': chunksize,
+      'Content-Type': 'application/octet-stream',
+    });
+    file.pipe(res);
+  } else {
+    res.writeHead(200, {
+      'Content-Length': fileSize,
+      'Content-Type': 'application/octet-stream',
+    });
+    fs.createReadStream(filePath).pipe(res);
+  }
+});
+
+app.delete('/api/vault/media/:mediaId', (req, res) => {
+  const rawId = req.params.mediaId || '';
+  const sanitizedId = rawId.replace(/[^a-zA-Z0-9_-]/g, '');
+  const mobile = req.query.mobile || req.headers['x-mobile'] || req.body?.mobile;
+  const cleanMobile = normalizePhone(mobile);
+
+  const filePath = path.join(VAULT_MEDIA_DIR, `${sanitizedId}.enc`);
+  if (fs.existsSync(filePath)) {
+    try {
+      fs.unlinkSync(filePath);
+    } catch (e) {
+      console.error('[Vault] Error deleting file:', e.message);
+    }
+  }
+
+  if (cleanMobile && vaultRegistry.has(cleanMobile)) {
+    vaultRegistry.get(cleanMobile).delete(sanitizedId);
+    persistVaultMetadata();
+
+    // Broadcast deletion to all linked devices
+    const activeSessions = getActiveDeviceSessions(cleanMobile);
+    for (const session of activeSessions) {
+      if (session.ws && session.ws.readyState === WebSocket.OPEN) {
+        session.ws.send(JSON.stringify({
+          type: 'VAULT_ITEM_DELETED',
+          itemId: sanitizedId
+        }));
+      }
+    }
+  } else {
+    // Search all accounts if mobile not provided
+    for (const [mob, itemMap] of vaultRegistry.entries()) {
+      if (itemMap.has(sanitizedId)) {
+        itemMap.delete(sanitizedId);
+        persistVaultMetadata();
+        const activeSessions = getActiveDeviceSessions(mob);
+        for (const session of activeSessions) {
+          if (session.ws && session.ws.readyState === WebSocket.OPEN) {
+            session.ws.send(JSON.stringify({
+              type: 'VAULT_ITEM_DELETED',
+              itemId: sanitizedId
+            }));
+          }
+        }
+        break;
+      }
+    }
+  }
+
+  res.json({ success: true, itemId: sanitizedId });
 });
 
 // Vault diagnostic and manual flush endpoints
@@ -843,6 +1074,43 @@ wss.on('connection', (ws, req) => {
               ...panicPayload,
               id: `panic_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`
             });
+          }
+          break;
+        }
+
+        case 'GET_VAULT_ITEMS': {
+          const cleanMobile = normalizePhone(msg.mobile || authenticatedMobile);
+          const itemsMap = vaultRegistry.get(cleanMobile);
+          const items = itemsMap ? Array.from(itemsMap.values()).sort((a, b) => b.createdAt - a.createdAt) : [];
+          ws.send(JSON.stringify({
+            type: 'VAULT_ITEMS_LIST',
+            items
+          }));
+          break;
+        }
+
+        case 'DELETE_VAULT_ITEM': {
+          const itemId = msg.itemId;
+          const cleanMobile = normalizePhone(msg.mobile || authenticatedMobile);
+          if (itemId && cleanMobile && vaultRegistry.has(cleanMobile)) {
+            const itemMap = vaultRegistry.get(cleanMobile);
+            if (itemMap.has(itemId)) {
+              itemMap.delete(itemId);
+              persistVaultMetadata();
+              const filePath = path.join(VAULT_MEDIA_DIR, `${itemId}.enc`);
+              if (fs.existsSync(filePath)) {
+                try { fs.unlinkSync(filePath); } catch (_) {}
+              }
+              const activeSessions = getActiveDeviceSessions(cleanMobile);
+              for (const session of activeSessions) {
+                if (session.ws && session.ws.readyState === WebSocket.OPEN) {
+                  session.ws.send(JSON.stringify({
+                    type: 'VAULT_ITEM_DELETED',
+                    itemId
+                  }));
+                }
+              }
+            }
           }
           break;
         }
